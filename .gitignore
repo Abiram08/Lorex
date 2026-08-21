@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.log
+.DS_Store
+.local-queue/
+longmemeval-out/
+data/
+lorex-graph.html
+verify-graph.html
+longmemeval-*results*.json
+*.progress.jsonl

@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "sourceMap": false,
+    "declarationMap": false
+  },
+  "exclude": [
+    "node_modules",
+    "dist",
+    "src/tests",
+    "src/evaluation",
+    "src/demo-crossagent.ts"
+  ]
+}

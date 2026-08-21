@@ -1,0 +1,61 @@
+{
+  "name": "@lorex/cli",
+  "version": "0.3.0",
+  "description": "Agent memory and context layer on HydraDB: temporal, graph-connected, evidence-backed project memory that abstains when the history does not support an answer.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "lorex": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build && npm test",
+    "start": "node dist/index.js start",
+    "dev": "tsx src/index.ts",
+    "init": "node dist/index.js init",
+    "doctor": "node dist/index.js doctor",
+    "dashboard": "node dist/index.js dashboard",
+    "test": "npm run test:core && npm run test:capabilities && npm run test:infra && npm run verify",
+    "test:core": "tsx src/tests/core.ts",
+    "test:capabilities": "tsx src/tests/requirements.ts",
+    "test:infra": "tsx src/tests/infrastructure.ts",
+    "demo": "tsx src/demo-crossagent.ts",
+    "bench": "tsx src/evaluation/longmemeval.ts",
+    "bench:mock": "tsx src/evaluation/longmemeval.ts --mock --in longmemeval-sample.jsonl --out longmemeval-mock-results.json --fresh",
+    "bench:slice": "tsx src/evaluation/longmemeval.ts --live --limit 50 --out longmemeval-50-results.json",
+    "bench:live": "tsx src/evaluation/longmemeval.ts --live --out longmemeval-live-results.json",
+    "bench:download": "curl -L --fail --retry 5 --retry-all-errors -C - -o data/longmemeval_s.json https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json",
+    "build:all": "tsc",
+    "verify": "npm run build && node verify.mjs"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "mcp",
+    "agent-memory",
+    "context",
+    "hydradb",
+    "retrieval",
+    "longmemeval"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "js-tiktoken": "^1.0.21",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.119.0",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}

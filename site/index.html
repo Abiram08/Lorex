@@ -1,0 +1,1059 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lorex — memory that knows what changed</title>
+<meta name="description" content="An agent memory and context layer on HydraDB. Fifty sessions of history become a 2,200-token evidence pack that tracks what was overwritten and why, and declines when the history has no answer.">
+<meta property="og:title" content="Lorex">
+<meta property="og:description" content="Memory that knows what changed.">
+<meta property="og:type" content="website">
+<meta name="theme-color" content="#0A0A0A">
+<link rel="icon" href="lorex-icon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@200;300;400;500;700&display=swap">
+
+<style>
+  :root{
+    --void:#0A0A0A;
+    --plate:#0D0D0C;
+    --raise:#111110;
+    --rule:#1E1D1A;
+    --rule-hi:#2C2A26;
+    --bone:#DFD8CB;
+    --dim:#8B857A;
+    --faint:#4E4A44;
+    --ghost:#2A2823;
+    --ember:#E4572E;
+    --ember-dim:#7A3220;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--void);color:var(--bone);
+    font-family:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:14px;line-height:1.65;font-weight:400;
+    -webkit-font-smoothing:antialiased;overflow-x:hidden;
+  }
+  #dots{position:fixed;inset:0;z-index:0;pointer-events:none}
+  .layer{position:relative;z-index:1}
+  .wrap{max-width:1200px;margin:0 auto;padding:0 clamp(1rem,3.5vw,2.5rem)}
+
+  h1,h2,h3,h4{margin:0;font-weight:300;letter-spacing:-.03em;text-wrap:balance}
+  p{margin:0;color:var(--dim)}
+  a{color:inherit}
+
+  .kicker{
+    font-size:10px;font-weight:500;letter-spacing:.24em;text-transform:uppercase;
+    color:var(--faint);display:flex;align-items:center;gap:.7rem;
+  }
+  .kicker::before{content:"";width:16px;height:1px;background:var(--ember)}
+
+  /* ── nav ───────────────────────────────────── */
+  nav{position:sticky;top:0;z-index:50;background:rgba(10,10,10,.9);backdrop-filter:blur(16px);border-bottom:1px solid var(--rule)}
+  .navbar{display:flex;align-items:center;gap:2rem;height:56px}
+  .brand{display:flex;align-items:center;gap:.55rem;text-decoration:none}
+  .brand svg{width:17px;height:19px}
+  .brand b{font-weight:500;letter-spacing:.05em;font-size:14px}
+  .navlinks{margin-left:auto;display:flex;gap:1.6rem;font-size:12px}
+  .navlinks a{color:var(--dim);text-decoration:none;position:relative;padding:2px 0}
+  .navlinks a::after{content:"";position:absolute;left:0;right:100%;bottom:-2px;height:1px;background:var(--ember);transition:right .22s}
+  .navlinks a:hover{color:var(--bone)}
+  .navlinks a:hover::after{right:0}
+  .ghost-btn{
+    border:1px solid var(--rule-hi);padding:.35rem .8rem;font-size:12px;
+    text-decoration:none;color:var(--bone);transition:background .18s,border-color .18s;
+  }
+  .ghost-btn:hover{background:var(--raise);border-color:var(--bone)}
+  @media(max-width:860px){.navlinks{display:none}}
+
+  /* ── hero ──────────────────────────────────── */
+  .hero{padding:clamp(3.5rem,9vw,7rem) 0 0;position:relative}
+  .hero-grid{display:grid;gap:clamp(2rem,4vw,3.5rem)}
+  @media(min-width:1040px){.hero-grid{grid-template-columns:1.05fr .95fr;align-items:start}}
+  h1{font-size:clamp(2.4rem,6.2vw,4.4rem);line-height:1.02;font-weight:200;letter-spacing:-.045em}
+  h1 .em{color:var(--ember)}
+  .hero-sub{max-width:46ch;margin-top:1.5rem;font-size:15px;font-weight:300;line-height:1.7}
+  .hero-cta{display:flex;gap:.6rem;flex-wrap:wrap;margin-top:2rem}
+  .btn{
+    display:inline-flex;align-items:center;gap:.6rem;padding:.65rem 1.1rem;
+    border:1px solid var(--bone);background:var(--bone);color:var(--void);
+    text-decoration:none;font-size:13px;font-weight:500;transition:opacity .18s;
+  }
+  .btn:hover{opacity:.85}
+  .btn.alt{background:transparent;color:var(--bone);border-color:var(--rule-hi)}
+  .btn.alt:hover{border-color:var(--bone);background:var(--raise);opacity:1}
+
+  /* terminal */
+  .term{border:1px solid var(--rule);background:#070706;font-size:12.5px;line-height:1.75}
+  .term-bar{display:flex;align-items:center;gap:.5rem;padding:.5rem .8rem;border-bottom:1px solid var(--rule);color:var(--faint);font-size:10px;letter-spacing:.14em;text-transform:uppercase}
+  .term-bar i{width:7px;height:7px;background:var(--ghost);display:block}
+  .term-bar i:first-of-type{background:var(--ember-dim)}
+  .term-body{padding:1rem;min-height:250px;white-space:pre-wrap;word-break:break-word}
+  .term-body .pr{color:var(--faint)}
+  .term-body .cm{color:var(--bone)}
+  .term-body .ok{color:var(--bone)}
+  .term-body .mut{color:var(--dim)}
+  .term-body .hot{color:var(--ember)}
+  .term-body .cur{background:var(--bone);color:#070706}
+
+  .ticker{display:grid;grid-template-columns:repeat(2,1fr);border:1px solid var(--rule);border-bottom:0;margin-top:clamp(2.5rem,5vw,4rem)}
+  @media(min-width:760px){.ticker{grid-template-columns:repeat(4,1fr)}}
+  .tick{padding:1.1rem 1.2rem;border-bottom:1px solid var(--rule);border-right:1px solid var(--rule);position:relative;overflow:hidden;transition:background .2s}
+  .tick:hover{background:var(--raise)}
+  .tick:last-child{border-right:0}
+  @media(max-width:759px){.tick:nth-child(2n){border-right:0}}
+  .tick b{display:block;font-size:1.7rem;font-weight:200;letter-spacing:-.04em;font-variant-numeric:tabular-nums;line-height:1}
+  .tick span{display:block;margin-top:.45rem;font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
+
+  /* ── section frame ─────────────────────────── */
+  section{border-top:1px solid var(--rule);padding:clamp(3.5rem,7vw,5.5rem) 0}
+  .sec-head{display:grid;gap:1rem;margin-bottom:2.5rem;max-width:62ch}
+  h2{font-size:clamp(1.7rem,3.4vw,2.5rem);line-height:1.15}
+  .sec-head p{font-size:15px;font-weight:300;line-height:1.7}
+
+  /* ── split compare ─────────────────────────── */
+  .compare{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule)}
+  @media(min-width:900px){.compare{grid-template-columns:1fr 1fr}}
+  .pane{background:var(--plate);padding:1.5rem;transition:background .2s}
+  .pane:hover{background:var(--raise)}
+  .pane-h{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.1rem;padding-bottom:.7rem;border-bottom:1px solid var(--rule)}
+  .pane-h b{font-size:12px;font-weight:500;letter-spacing:.1em;text-transform:uppercase}
+  .tag{font-size:10px;letter-spacing:.1em;text-transform:uppercase;padding:.15rem .5rem;border:1px solid var(--rule-hi);color:var(--faint)}
+  .tag.bad{color:var(--ember);border-color:var(--ember-dim)}
+  .tag.good{color:var(--bone);border-color:var(--rule-hi)}
+  .row{display:flex;gap:.8rem;padding:.5rem 0;font-size:12.5px;align-items:baseline}
+  .row .w{width:78px;flex:none;color:var(--faint);font-size:10px;letter-spacing:.1em;text-transform:uppercase}
+  .row .v{color:var(--dim)}
+  .row.hi .v{color:var(--bone)}
+  .row.dead .v{color:var(--ghost);text-decoration:line-through}
+
+  /* ── pipeline ──────────────────────────────── */
+  .pipe{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule)}
+  @media(min-width:920px){.pipe{grid-template-columns:repeat(4,1fr)}}
+  .stage{background:var(--plate);padding:1.4rem;cursor:default;transition:background .2s;position:relative}
+  .stage:hover{background:var(--raise)}
+  .stage:hover .stage-px{opacity:1}
+  .stage-px{position:absolute;top:1.4rem;right:1.4rem;display:grid;grid-template-columns:repeat(3,3px);gap:2px;opacity:.25;transition:opacity .25s}
+  .stage-px i{width:3px;height:3px;background:var(--ember);display:block}
+  .stage .n{font-size:10px;letter-spacing:.18em;color:var(--ember);display:block;margin-bottom:.9rem}
+  .stage h3{font-size:14px;font-weight:500;margin-bottom:.5rem;letter-spacing:-.01em}
+  .stage p{font-size:12.5px;line-height:1.65}
+
+  /* ── interactive supersession ──────────────── */
+  .demo{border:1px solid var(--rule);background:var(--plate)}
+  .demo-top{display:flex;flex-wrap:wrap;gap:.5rem;padding:1rem;border-bottom:1px solid var(--rule)}
+  .chip{
+    border:1px solid var(--rule-hi);background:transparent;color:var(--dim);
+    font:inherit;font-size:12px;padding:.4rem .8rem;cursor:pointer;transition:all .18s;
+  }
+  .chip:hover:not(:disabled){border-color:var(--bone);color:var(--bone)}
+  .chip:disabled{opacity:.3;cursor:default}
+  .chip.armed{border-color:var(--ember);color:var(--ember)}
+  .demo-body{display:grid;gap:1px;background:var(--rule)}
+  @media(min-width:840px){.demo-body{grid-template-columns:1fr 1fr}}
+  .demo-col{background:var(--plate);padding:1.2rem;min-height:190px}
+  .demo-col h4{font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint);margin-bottom:.9rem}
+  .mem{border-left:2px solid var(--rule-hi);padding:.35rem 0 .35rem .8rem;margin-bottom:.7rem;font-size:12.5px;transition:all .3s}
+  .mem .when{color:var(--faint);font-size:10.5px;letter-spacing:.06em}
+  .mem.old{border-left-color:var(--ghost);color:var(--ghost)}
+  .mem.old .when{color:var(--ghost)}
+  .mem.now{border-left-color:var(--bone)}
+  .mem .why{color:var(--ember);font-size:11.5px;display:block;margin-top:.2rem}
+  .out{font-size:12.5px;white-space:pre-wrap;color:var(--dim);line-height:1.7}
+  .out .k{color:var(--faint)}
+  .out .s{color:var(--bone)}
+  .out .h{color:var(--ember)}
+
+  /* ── compression ───────────────────────────── */
+  .comp{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule)}
+  @media(min-width:900px){.comp{grid-template-columns:1.4fr 1fr}}
+  .comp-viz{background:#060605;position:relative;min-height:280px}
+  #compcanvas{position:absolute;inset:0;width:100%;height:100%}
+  .comp-legend{position:absolute;left:1rem;bottom:1rem;display:grid;gap:.4rem;font-size:11px;color:var(--faint)}
+  .comp-legend div{display:flex;align-items:center;gap:.6rem}
+  .sq{width:8px;height:8px;flex:none}
+  .sq.hay{background:#312E29}
+  .sq.pack{background:var(--bone)}
+  .comp-side{background:var(--plate);padding:1.6rem;display:grid;align-content:center;gap:1.1rem}
+  .comp-side .big{font-size:3rem;font-weight:200;letter-spacing:-.05em;line-height:1}
+  .comp-side .big em{font-style:normal;color:var(--ember)}
+  .comp-side p{font-size:12.5px;line-height:1.7}
+  .measure{display:grid;gap:.5rem;font-size:12px;border-top:1px solid var(--rule);padding-top:1rem}
+  .measure div{display:flex;justify-content:space-between;gap:1rem}
+  .measure span:last-child{color:var(--bone);font-variant-numeric:tabular-nums}
+
+  /* ── graph ─────────────────────────────────── */
+  .graphbox{border:1px solid var(--rule);background:#000;height:min(56vh,420px);position:relative;overflow:hidden}
+  #graphcanvas{position:absolute;inset:0;width:100%;height:100%}
+  .gkey{position:absolute;left:1rem;bottom:1rem;display:grid;gap:.4rem;font-size:11px;color:var(--faint)}
+  .gkey div{display:flex;align-items:center;gap:.6rem}
+  .gk{width:9px;height:9px;flex:none}
+  .gk.on{background:var(--bone)}
+  .gk.off{border:1px solid var(--faint)}
+  .gk.why{background:var(--ember);height:2px;width:15px}
+
+  /* ── tools ─────────────────────────────────── */
+  .tools{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule)}
+  @media(min-width:640px){.tools{grid-template-columns:repeat(2,1fr)}}
+  @media(min-width:1000px){.tools{grid-template-columns:repeat(3,1fr)}}
+  .tool{background:var(--plate);padding:1.1rem 1.2rem;transition:background .2s;position:relative;overflow:hidden}
+  .tool:hover{background:var(--raise)}
+  .tool b{font-size:13px;font-weight:500;display:flex;align-items:center;gap:.5rem}
+  .tool b::before{content:"";width:5px;height:5px;background:var(--faint);transition:background .2s}
+  .tool:hover b::before{background:var(--ember)}
+  .tool p{font-size:12px;margin-top:.45rem;line-height:1.6}
+
+  /* ── matrix ────────────────────────────────── */
+  .matrix{width:100%;border-collapse:collapse;font-size:12.5px;border:1px solid var(--rule)}
+  .matrix th,.matrix td{padding:.75rem 1rem;text-align:left;border-bottom:1px solid var(--rule)}
+  .matrix thead th{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);font-weight:500;background:var(--plate)}
+  .matrix tbody tr{transition:background .18s}
+  .matrix tbody tr:hover{background:var(--raise)}
+  .matrix td:first-child{color:var(--bone)}
+  .matrix td{color:var(--dim)}
+  .yes{color:var(--bone)}
+  .no{color:var(--ghost)}
+  .table-scroll{overflow-x:auto}
+
+  /* ── install tabs ──────────────────────────── */
+  .tabs{display:flex;gap:0;border:1px solid var(--rule);border-bottom:0;flex-wrap:wrap}
+  .tab{
+    background:transparent;border:0;border-right:1px solid var(--rule);
+    color:var(--faint);font:inherit;font-size:12px;padding:.7rem 1.1rem;cursor:pointer;transition:all .18s;
+  }
+  .tab:hover{color:var(--bone)}
+  .tab[aria-selected="true"]{color:var(--bone);background:var(--raise);box-shadow:inset 0 -2px 0 var(--ember)}
+  .tabpanel{border:1px solid var(--rule);background:#070706;padding:1.2rem;font-size:12.5px;white-space:pre-wrap;line-height:1.75;overflow-x:auto}
+  .tabpanel .k{color:var(--faint)}
+  .tabpanel .v{color:var(--bone)}
+
+  .copybar{display:flex;align-items:center;gap:.9rem;border:1px solid var(--rule);padding:.65rem .9rem;margin-top:1rem;font-size:13px;background:var(--plate)}
+  .copybar code{color:var(--bone)}
+  .copybar .pr{color:var(--faint)}
+  .copybar button{margin-left:auto;background:none;border:1px solid var(--rule-hi);color:var(--faint);font:inherit;font-size:11px;padding:.25rem .6rem;cursor:pointer;transition:all .18s}
+  .copybar button:hover{color:var(--bone);border-color:var(--bone)}
+
+  .note{border-left:2px solid var(--ember);padding-left:1rem;margin-top:1.6rem;max-width:64ch}
+  .note p{font-size:12.5px}
+
+  footer{border-top:1px solid var(--rule);padding:2.5rem 0}
+  .foot{display:flex;gap:1.5rem;flex-wrap:wrap;align-items:center;font-size:11.5px;color:var(--faint)}
+  .foot .sp{margin-left:auto;display:flex;gap:1.4rem}
+  .foot a{text-decoration:none;color:var(--faint)}
+  .foot a:hover{color:var(--bone)}
+
+  :focus-visible{outline:1px solid var(--ember);outline-offset:3px}
+  @media(prefers-reduced-motion:reduce){#dots{opacity:.35}}
+
+  /* ── stats band (compound-intelligence style) ── */
+  .stats{
+    display:grid;gap:1px;background:var(--rule);
+    border:1px solid var(--rule);margin-top:3.5rem;
+  }
+  @media(min-width:760px){.stats{grid-template-columns:1fr 1fr}}
+  .stat{
+    background:var(--plate);padding:1.8rem 1.6rem;position:relative;overflow:hidden;
+    transition:background .2s;
+  }
+  .stat:hover{background:var(--raise)}
+  .stat::after{
+    content:"";position:absolute;right:0;top:0;width:14px;height:14px;
+    background:var(--ember);opacity:0;transition:opacity .25s;
+  }
+  .stat:hover::after{opacity:1}
+  .stat b{display:block;font-size:clamp(2.4rem,5vw,3.6rem);font-weight:200;letter-spacing:-.04em;line-height:1;color:var(--bone)}
+  .stat b em{font-style:normal;color:var(--ember)}
+  .stat h3{margin:.9rem 0 .45rem;font-size:13px;font-weight:500;letter-spacing:.02em}
+  .stat p{font-size:12.5px;line-height:1.65}
+
+  /* ── architecture overview ── */
+  .arch{border:1px solid var(--rule-hi);background:var(--plate)}
+  .arch-cap{
+    padding:.55rem .9rem;border-bottom:1px solid var(--rule);
+    font-size:10px;letter-spacing:.22em;text-transform:uppercase;color:var(--ember);
+  }
+  .arch-body{padding:clamp(1.2rem,3vw,2.2rem);display:flex;flex-direction:column;gap:0}
+  .arch-row{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule)}
+  @media(min-width:820px){.arch-row.c3{grid-template-columns:1fr 1fr 1fr}.arch-row.c2{grid-template-columns:1fr 1fr}}
+  .arch-cell{background:var(--raise);padding:1.1rem 1.2rem}
+  .arch-cell b{display:block;font-size:12.5px;font-weight:500;color:var(--bone);letter-spacing:.02em}
+  .arch-cell span{display:block;margin-top:.35rem;font-size:11.5px;color:var(--dim);line-height:1.6}
+  .arch-cell.hot{background:#160D09;border-color:var(--ember-dim)}
+  .arch-cell.hot b{color:var(--ember)}
+  .arch-link{
+    align-self:center;padding:.55rem 0;color:var(--faint);font-size:13px;
+  }
+  .arch-band{
+    margin-top:1.2rem;border:1px dashed var(--rule-hi);padding:.8rem 1rem;
+    font-size:11px;color:var(--dim);display:flex;gap:1.5rem;flex-wrap:wrap;
+  }
+  .arch-band i{font-style:normal;color:var(--ember)}
+
+  /* ── FAQ ── */
+  .faq{max-width:760px}
+  .faq-item{border-bottom:1px solid var(--rule)}
+  .faq-q{
+    width:100%;text-align:left;background:none;border:none;color:var(--bone);
+    font:inherit;font-size:13.5px;padding:1.05rem .2rem;cursor:pointer;
+    display:flex;align-items:center;justify-content:space-between;gap:1rem;
+  }
+  .faq-q:hover{color:var(--ember)}
+  .faq-q i{font-style:normal;color:var(--faint);transition:transform .2s;flex-shrink:0}
+  .faq-item.open .faq-q i{transform:rotate(45deg);color:var(--ember)}
+  .faq-a{display:none;padding:0 .2rem 1.2rem;font-size:12.5px;line-height:1.75;color:var(--dim);max-width:64ch}
+  .faq-item.open .faq-a{display:block}
+
+  /* ── footer dither ── */
+  #dither{display:block;width:100%;height:120px;border-top:1px solid var(--rule)}
+</style>
+</head>
+<body>
+<canvas id="dots" aria-hidden="true"></canvas>
+
+<div class="layer">
+
+<nav>
+  <div class="wrap navbar">
+    <a class="brand" href="#top">
+      <svg viewBox="0 0 190 210" aria-hidden="true"><g transform="translate(0,210) scale(0.1,-0.1)" fill="#DFD8CB"><path d="M892 1848 c-50 -17 -122 -86 -148 -143 -37 -79 -33 -137 17 -233 36 -68 41 -85 35 -117 -15 -77 -110 -141 -185 -124 -180 42 -335 -63 -349 -236 -6 -81 23 -150 89 -209 59 -53 116 -71 204 -64 142 12 229 106 254 278 24 156 104 264 253 339 99 51 130 78 163 145 31 63 34 160 6 222 -23 51 -76 104 -127 129 -46 22 -163 29 -212 13z M1345 1225 c-102 -38 -159 -119 -181 -256 -8 -50 -25 -112 -36 -138 -32 -67 -139 -169 -225 -214 -40 -21 -86 -51 -103 -68 -100 -101 -104 -255 -10 -362 104 -117 291 -116 393 4 83 96 87 210 13 328 -45 71 -27 144 49 191 37 23 40 23 126 11 122 -17 179 -1 254 72 42 41 57 64 70 110 36 125 -19 248 -139 309 -53 27 -156 33 -211 13z"/></g></svg>
+      <b>lorex</b>
+    </a>
+    <div class="navlinks">
+      <a href="#problem">Problem</a>
+      <a href="#numbers">Numbers</a>
+      <a href="#chain">Supersession</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#graph">Graph</a>
+      <a href="#tools">Tools</a>
+      <a href="#faq">FAQ</a>
+    </div>
+    <a class="ghost-btn" href="#install">Install</a>
+  </div>
+</nav>
+
+<header class="hero" id="top">
+  <div class="wrap">
+    <div class="hero-grid">
+      <div>
+        <p class="kicker">Agent memory on HydraDB</p>
+        <h1 style="margin-top:1.4rem">Memory that knows what <span class="em">changed</span>.</h1>
+        <p class="hero-sub">
+          Fifty sessions of history become a 2,200-token evidence pack. Values that
+          were replaced stay in the record, marked and dated, with the reason
+          attached. When the history has no answer, it says so instead of
+          inventing one.
+        </p>
+        <div class="hero-cta">
+          <a class="btn" href="#install">Get started <span>→</span></a>
+          <a class="btn alt" href="#graph">See the graph</a>
+        </div>
+      </div>
+
+      <div class="term">
+        <div class="term-bar"><i></i><i></i><i></i><span style="margin-left:.4rem">lorex</span></div>
+        <div class="term-body" id="term"></div>
+      </div>
+    </div>
+
+    <div class="ticker">
+      <div class="tick"><b>46.2×</b><span>fewer tokens</span></div>
+      <div class="tick"><b>2,235</b><span>tokens per pack</span></div>
+      <div class="tick"><b>12</b><span>MCP tools</span></div>
+      <div class="tick"><b>3</b><span>dependencies</span></div>
+    </div>
+  </div>
+</header>
+
+<section id="numbers" style="padding-top:3.5rem">
+  <div class="wrap">
+    <div class="stats">
+      <div class="stat">
+        <b>46<em>×</em></b>
+        <h3>Smaller than the history</h3>
+        <p>The pack budget is derived from the measured haystack — haystack ÷ 46 — counted with a real BPE tokenizer and enforced at assembly. A pack that breaks the ratio cannot be produced.</p>
+      </div>
+      <div class="stat">
+        <b>1.08<em>%</em></b>
+        <h3>Of the context, all of the signal</h3>
+        <p>103,169 tokens of measured history returned as a 2,235-token evidence pack: current values ranked first, replaced ones marked and dated, reasons attached.</p>
+      </div>
+      <div class="stat">
+        <b>7</b>
+        <h3>Reasons to say nothing</h3>
+        <p>Lorex declines for seven distinct reasons — no evidence, low confidence, outside the time window, contradictory values, and more. Sources are returned even when the claim is withheld.</p>
+      </div>
+      <div class="stat">
+        <b>12</b>
+        <h3>Tools, one shared memory</h3>
+        <p>Claude Code, Cursor, Windsurf and Codex read and write the same store through one MCP server. Every write is attributed; every handoff carries the next step.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="problem">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">The problem</p>
+      <h2>A bigger window holds both answers equally.</h2>
+      <p>
+        When a value is overwritten, a flat context window keeps the old statement
+        and the new one side by side with nothing to separate them. The model has
+        to work out which is current by reading — every single time.
+      </p>
+    </div>
+
+    <div class="compare">
+      <div class="pane">
+        <div class="pane-h"><b>Flat context window</b><span class="tag bad">115,000 tokens</span></div>
+        <div class="row"><span class="w">Jan 10</span><span class="v">"We use MongoDB for session storage"</span></div>
+        <div class="row"><span class="w">Feb 02</span><span class="v">"We switched to Redis for session storage"</span></div>
+        <div class="row"><span class="w">Status</span><span class="v">both present, neither marked</span></div>
+        <div class="row"><span class="w">Reason</span><span class="v">somewhere in the transcript, unlinked</span></div>
+        <div class="row"><span class="w">Unknown</span><span class="v">answers anyway</span></div>
+      </div>
+      <div class="pane">
+        <div class="pane-h"><b>Lorex</b><span class="tag good">2,235 tokens</span></div>
+        <div class="row dead"><span class="w">Jan 10</span><span class="v">MongoDB · superseded, closed Feb 02</span></div>
+        <div class="row hi"><span class="w">Feb 02</span><span class="v">Redis · current</span></div>
+        <div class="row hi"><span class="w">Status</span><span class="v">ranked, current first</span></div>
+        <div class="row hi"><span class="w">Reason</span><span class="v" style="color:var(--ember)">because Atlas kept timing out</span></div>
+        <div class="row hi"><span class="w">Unknown</span><span class="v">abstains, keeps the sources</span></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="pipeline">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Pipeline</p>
+      <h2>Four stages, each one auditable.</h2>
+      <p>Every operation returns a receipt: its sources, its token cost, and whether it declined.</p>
+    </div>
+
+    <div class="pipe">
+      <div class="stage">
+        <div class="stage-px"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <span class="n">01 · CAPTURE</span>
+        <h3>Sessions in</h3>
+        <p>Turns normalized, duplicates dropped, content chunked to 400 tokens. Durable statements extracted and keyed by what they are about, not what was chosen.</p>
+      </div>
+      <div class="stage">
+        <div class="stage-px"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <span class="n">02 · VERSION</span>
+        <h3>Nothing overwritten</h3>
+        <p>A replaced value has its interval closed and keeps its place. The replacement points back at it and carries the reason for the change.</p>
+      </div>
+      <div class="stage">
+        <div class="stage-px"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <span class="n">03 · RETRIEVE</span>
+        <h3>A budget, not a dump</h3>
+        <p>Pack size is derived from the measured history — haystack ÷ 46 — and enforced at assembly. Superseded values rank below current ones regardless of match score.</p>
+      </div>
+      <div class="stage">
+        <div class="stage-px"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <span class="n">04 · ABSTAIN</span>
+        <h3>Silence is an answer</h3>
+        <p>The pack is assembled first, so the evidence survives even when the claim is withheld. Withholding the answer and withholding the sources are separate decisions.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="chain">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Try it</p>
+      <h2>Watch a decision get overwritten.</h2>
+      <p>Record two decisions about the same subject, then ask. This is the real behaviour, not a mock-up.</p>
+    </div>
+
+    <div class="demo">
+      <div class="demo-top">
+        <button class="chip armed" id="s1">remember · MongoDB <span style="color:var(--faint)">Jan 10</span></button>
+        <button class="chip" id="s2" disabled>remember · Redis <span style="color:var(--faint)">Feb 02</span></button>
+        <button class="chip" id="s3" disabled>recall · "what do we use?"</button>
+        <button class="chip" id="s4" disabled>why · session_store</button>
+        <button class="chip" id="reset" style="margin-left:auto">reset</button>
+      </div>
+      <div class="demo-body">
+        <div class="demo-col">
+          <h4>Memory store</h4>
+          <div id="store"><p style="font-size:12.5px;color:var(--ghost)">empty</p></div>
+        </div>
+        <div class="demo-col">
+          <h4>Receipt</h4>
+          <div class="out" id="receipt"><span style="color:var(--ghost)">nothing yet</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="compression">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Compression</p>
+      <h2>Enforced, not observed.</h2>
+      <p>
+        The budget is derived from the measured history and clamped at assembly,
+        so a pack that breaks the ratio cannot be produced. Tokens are counted
+        with a real BPE tokenizer, never estimated.
+      </p>
+    </div>
+
+    <div class="comp">
+      <div class="comp-viz">
+        <canvas id="compcanvas" aria-hidden="true"></canvas>
+        <div class="comp-legend">
+          <div><span class="sq hay"></span>103,169 tokens of history</div>
+          <div><span class="sq pack"></span>2,235 tokens returned</div>
+        </div>
+      </div>
+      <div class="comp-side">
+        <div class="big">46.2<em>×</em></div>
+        <p>Measured across twelve stratified LongMemEval questions on real haystacks. Reproducible in about a minute, with no API key of any kind.</p>
+        <div class="measure">
+          <div><span>avg haystack</span><span>103,169</span></div>
+          <div><span>avg pack</span><span>2,235</span></div>
+          <div><span>hard ceiling</span><span>2,500</span></div>
+          <div><span>meets target</span><span>yes</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="copybar">
+      <span class="pr">$</span><code>npm run bench:mock -- --no-llm-judge --limit 12</code>
+      <button data-copy="npm run bench:mock -- --no-llm-judge --limit 12">copy</button>
+    </div>
+  </div>
+</section>
+
+<section id="graph">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Context graph</p>
+      <h2>The memory, drawing itself.</h2>
+      <p>
+        HydraDB resolves entities and maps relations. Lorex adds supersession
+        edges, causal reasons, and agent authorship on top. Run it live in a
+        second window and it redraws as your agent works.
+      </p>
+    </div>
+
+    <div class="graphbox">
+      <canvas id="graphcanvas" aria-hidden="true"></canvas>
+      <div class="gkey">
+        <div><span class="gk on"></span>current value</div>
+        <div><span class="gk off"></span>replaced</div>
+        <div><span class="gk why"></span>supersedes, with reason</div>
+      </div>
+    </div>
+
+    <div class="copybar">
+      <span class="pr">$</span><code>lorex graph --live</code>
+      <button data-copy="lorex graph --live">copy</button>
+    </div>
+  </div>
+</section>
+
+<section id="tools">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">MCP surface</p>
+      <h2>Twelve tools your agent already knows how to call.</h2>
+      <p>Point Claude Code, Cursor, Windsurf or Codex at one stdio server. No SDK, no glue code.</p>
+    </div>
+
+    <div class="tools">
+      <div class="tool"><b>recall</b><p>Query memory with a time window and graph traversal. Returns the pack, compression stats, and abstention.</p></div>
+      <div class="tool"><b>remember</b><p>Store a fact. An id binds it to a topic; <em>because</em> records why it replaced the last value.</p></div>
+      <div class="tool"><b>why</b><p>Walk a fact's supersession chain and return the recorded reasons in one hop.</p></div>
+      <div class="tool"><b>handoff</b><p>Record a decision and the next step for whichever agent picks the work up.</p></div>
+      <div class="tool"><b>resume</b><p>Session-start pack, with cross-agent attribution and the latest handoff.</p></div>
+      <div class="tool"><b>history</b><p>Full version timeline for a fact, including everything it replaced.</p></div>
+      <div class="tool"><b>learn</b><p>Store grounding content verbatim in the knowledge corpus.</p></div>
+      <div class="tool"><b>list</b><p>Snapshot of what is currently stored.</p></div>
+      <div class="tool"><b>forget</b><p>Soft-delete a topic. History is retained; no current value survives.</p></div>
+      <div class="tool"><b>report</b><p>Send retrieval feedback back to HydraDB to improve later ranking.</p></div>
+      <div class="tool"><b>capture_session</b><p>Ingest an entire chat session through the pipeline in one call.</p></div>
+      <div class="tool"><b>usage</b><p>Show rate-limit consumption and the pending write queue, so an agent can pace itself.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="matrix">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Comparison</p>
+      <h2>Where it differs.</h2>
+    </div>
+    <div class="table-scroll">
+      <table class="matrix">
+        <thead>
+          <tr><th>Capability</th><th>Flat window</th><th>Vector store</th><th>Lorex</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Distinguishes current from replaced</td><td class="no">no</td><td class="no">no</td><td class="yes">validity intervals</td></tr>
+          <tr><td>Records why a value changed</td><td class="no">no</td><td class="no">no</td><td class="yes">causal edge</td></tr>
+          <tr><td>Answers "what was true in March"</td><td class="no">no</td><td class="no">no</td><td class="yes">asOf query</td></tr>
+          <tr><td>Declines when unsupported</td><td class="no">no</td><td class="no">no</td><td class="yes">abstains, keeps sources</td></tr>
+          <tr><td>Bounded context cost</td><td class="no">whole window</td><td class="no">top-k, unbounded</td><td class="yes">haystack ÷ 46</td></tr>
+          <tr><td>Cross-agent attribution</td><td class="no">no</td><td class="no">no</td><td class="yes">stamped per write</td></tr>
+          <tr><td>Returns evidence, not prose</td><td class="no">no</td><td class="yes">chunks</td><td class="yes">ranked, dated, cited</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Architecture</p>
+      <h2>A policy layer over the graph database.</h2>
+      <p>Lorex does not reimplement a vector database. HydraDB owns storage, retrieval, and graph traversal. Lorex owns what makes retrieved context trustworthy.</p>
+    </div>
+
+    <div class="arch">
+      <div class="arch-cap">Orchestration around the graph database</div>
+      <div class="arch-body">
+        <div class="arch-row c3">
+          <div class="arch-cell"><b>Agents</b><span>Claude Code · Cursor · Windsurf · Codex — via MCP stdio, or the CLI in any terminal</span></div>
+          <div class="arch-cell hot"><b>Lorex policy layer</b><span>Versioning · causal edges · pack budget (haystack ÷ 46) · abstention gate · rate limits · receipts</span></div>
+          <div class="arch-cell"><b>HydraDB</b><span>Memory + knowledge corpora · hybrid retrieval · entity graph · as_of windows · feedback</span></div>
+        </div>
+        <span class="arch-link">▼</span>
+        <div class="arch-row c2">
+          <div class="arch-cell"><b>Ingestion pipeline</b><span>normalize → deduplicate → chunk → extract facts → supersede prior versions with reasons</span></div>
+          <div class="arch-cell"><b>Retrieval pipeline</b><span>plan intent → query → resolve current versions → assemble under budget → abstain or answer</span></div>
+        </div>
+        <div class="arch-band">
+          <span><i>■</i> durable write queue</span>
+          <span><i>■</i> persisted rate limiter</span>
+          <span><i>■</i> mock backend for offline runs</span>
+          <span><i>■</i> every operation returns a receipt</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">Install</p>
+      <h2>Three commands, then your agents share one memory.</h2>
+      <p>Node 20 or newer. Every command takes <em>--mock</em> to run entirely offline with no key at all.</p>
+    </div>
+
+    <div class="copybar">
+      <span class="pr">$</span><code id="cmd">npm i -g @lorex/cli &amp;&amp; lorex init</code>
+      <button data-copy="npm i -g @lorex/cli && lorex init">copy</button>
+    </div>
+
+    <div style="margin-top:2rem">
+      <div class="tabs" role="tablist">
+        <button class="tab" role="tab" aria-selected="true" data-tab="claude">Claude Code</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="cursor">Cursor · Windsurf</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="codex">Codex</button>
+        <button class="tab" role="tab" aria-selected="false" data-tab="cli">Shell</button>
+      </div>
+      <div class="tabpanel" id="panel"></div>
+    </div>
+
+    <div class="note">
+      <p>
+        <strong style="color:var(--bone);font-weight:500">On the accuracy number.</strong>
+        An LLM-judged run scored 72.7% with zero hallucinations, but at n = 11 —
+        the run was cut short by a judge API quota. It is directional, not
+        settled. The compression figure above needs no model and can be
+        reproduced by anyone in about a minute.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap">
+    <div class="sec-head">
+      <p class="kicker">FAQ</p>
+      <h2>Frequently asked questions.</h2>
+    </div>
+    <div class="faq">
+      <div class="faq-item">
+        <button class="faq-q">How is this different from giving the agent a longer context window?<i>+</i></button>
+        <div class="faq-a">A bigger window holds both the old statement and the new one with nothing to separate them, and charges you for all of it every turn. Lorex returns only current values (unless you ask about the past), records why each value changed, and costs 46× less. It also declines when the history does not answer — a window always answers something.</div>
+      </div>
+      <div class="faq-item">
+        <button class="faq-q">Is it a vector database?<i>+</i></button>
+        <div class="faq-a">No — and deliberately. HydraDB owns storage, hybrid retrieval, and graph traversal. Lorex is the policy layer on top: versioning, causality, budget enforcement, abstention, identity, and rate limiting. Swapping or upgrading the store does not change the semantics.</div>
+      </div>
+      <div class="faq-item">
+        <button class="faq-q">Do my agents share memory?<i>+</i></button>
+        <div class="faq-a">Yes — that is the point. All agents pointed at the same workspace read and write one store in HydraDB. Claude Code can record a decision and a next step; Codex on another machine picks both up from <code>resume</code>, with attribution showing who wrote what.</div>
+      </div>
+      <div class="faq-item">
+        <button class="faq-q">What happens when the model does not know?<i>+</i></button>
+        <div class="faq-a">It abstains — with a specific reason and the sources that were considered. Withholding the claim and withholding the evidence are separate decisions, so you can always audit why. The abstention gate is measured lexical overlap between question and evidence, because retrieval scores provably cannot separate answerable from unanswerable questions.</div>
+      </div>
+      <div class="faq-item">
+        <button class="faq-q">Can a runaway agent burn my API quota?<i>+</i></button>
+        <div class="faq-a">No. Lorex enforces persisted rate limits — writes per hour and day, queries per hour, ingest tokens per day — inside the engine itself. When a cap is hit the agent is told exactly how long to wait. Failed writes retry from a durable queue instead of vanishing.</div>
+      </div>
+      <div class="faq-item">
+        <button class="faq-q">Does deleting lose history?<i>+</i></button>
+        <div class="faq-a">Nothing is hard-deleted. Forgetting closes a fact's validity window; superseded values keep their place in the timeline. Ask <code>asOf</code> a past date and the old value is the correct answer again.</div>
+      </div>
+      <div class="faq-item">
+        <button class="faq-q">Can I try it without an API key?<i>+</i></button>
+        <div class="faq-a">Every command accepts <code>--mock</code>, which swaps in a full in-process backend — same interface, lexical scoring, simulated graph context. Demos, tests, and the compression benchmark all run offline through it.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <canvas id="dither" aria-hidden="true"></canvas>
+  <div class="wrap foot">
+    <span>Lorex — agent memory and context layer on HydraDB</span>
+    <span class="sp">
+      <a href="#problem">Problem</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#tools">Tools</a>
+      <a href="#install">Install</a>
+      <span>MIT</span>
+    </span>
+  </div>
+</footer>
+
+</div>
+
+<script>
+(function(){
+"use strict";
+var reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+function fit(c){
+  var dpr = Math.min(devicePixelRatio||1,2), r = c.getBoundingClientRect();
+  c.width = Math.max(1,Math.round(r.width*dpr));
+  c.height = Math.max(1,Math.round(r.height*dpr));
+  var x = c.getContext("2d"); x.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx:x,w:r.width,h:r.height};
+}
+
+/* ── mouse-reactive pixel field ───────────────────────── */
+(function(){
+  var c = document.getElementById("dots");
+  var V = fit(c), GAP = 22, R = 190;
+  var mx = -9999, my = -9999, tx = -9999, ty = -9999;
+
+  addEventListener("mousemove", function(e){ tx = e.clientX; ty = e.clientY; });
+  addEventListener("mouseleave", function(){ tx = -9999; ty = -9999; });
+  addEventListener("resize", function(){ V = fit(c); });
+
+  var t0 = performance.now();
+  function draw(now){
+    mx += (tx-mx)*0.14; my += (ty-my)*0.14;
+    var ctx = V.ctx, t = (now-t0)/1000;
+    ctx.clearRect(0,0,V.w,V.h);
+    for (var y=GAP/2; y<V.h; y+=GAP){
+      for (var x=GAP/2; x<V.w; x+=GAP){
+        var dx = x-mx, dy = y-my;
+        var d = Math.sqrt(dx*dx+dy*dy);
+        var e = d < R ? 1 - d/R : 0;
+        e = e*e;
+        /* idle shimmer so the field breathes without input */
+        var shim = 0.5 + 0.5*Math.sin(t*0.7 + x*0.021 + y*0.017);
+        /* displacement: pixels lean away from the cursor */
+        var push = e*10;
+        var px = x + (d>0.01 ? dx/d*push : 0);
+        var py = y + (d>0.01 ? dy/d*push : 0);
+        var s = 2 + e*8;
+        var flick = shim > 0.965 && e < 0.05;
+        if (e > 0.55)      ctx.fillStyle = "#E4572E";
+        else if (e > 0.18) ctx.fillStyle = "#B0654A";
+        else               ctx.fillStyle = flick ? "#6b4433" : "#33302A";
+        ctx.globalAlpha = 0.16 + e*0.72 + (flick?0.25:0);
+        ctx.fillRect(px-s/2, py-s/2, s, s);
+      }
+    }
+    ctx.globalAlpha = 1;
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+})();
+
+/* ── hero terminal ────────────────────────────────────── */
+(function(){
+  var el = document.getElementById("term");
+  if (!el) return;
+  var script = [
+    {t:"cmd", s:"lorex remember --fact \"Session storage moved to Redis\" \\\n  --id session_store --because \"Atlas kept timing out\"\n"},
+    {t:"mut", s:"  Ingested 1 memory item · version session_store_v2\n\n"},
+    {t:"cmd", s:"lorex recall --query \"what do we use for sessions?\"\n"},
+    {t:"ok",  s:"  current     2026-02-02  Session storage moved to Redis\n"},
+    {t:"mut", s:"  superseded  2026-01-10  We use MongoDB for session storage\n"},
+    {t:"mut", s:"  2,235 tokens · 46.2x smaller than 103,169\n\n"},
+    {t:"cmd", s:"lorex why --factId session_store\n"},
+    {t:"mut", s:"  2026-01-10  MongoDB\n"},
+    {t:"hot", s:"  2026-02-02  Redis - because Atlas kept timing out\n\n"},
+    {t:"cmd", s:"lorex recall --query \"our travel expense policy?\"\n"},
+    {t:"hot", s:"  abstained: true  reason: evidence_not_relevant\n"},
+    {t:"mut", s:"  sources still returned: 4\n"}
+  ];
+
+  var li = 0, ci = 0, out = "";
+  function tick(){
+    if (li >= script.length){
+      el.innerHTML = out + '<span class="cur"> </span>';
+      setTimeout(function(){ li = 0; ci = 0; out = ""; tick(); }, 6000);
+      return;
+    }
+    var step = script[li];
+    if (step.t === "cmd"){
+      if (ci === 0) out += '<span class="pr">$ </span><span class="cm">';
+      ci++;
+      if (ci >= step.s.length){ out += step.s.slice(0,ci) + "</span>"; li++; ci = 0; }
+      el.innerHTML = out + (ci ? step.s.slice(0,ci) + "</span>" : "") + '<span class="cur"> </span>';
+      setTimeout(tick, 16);
+    } else {
+      out += '<span class="'+step.t+'">'+step.s+'</span>';
+      el.innerHTML = out + '<span class="cur"> </span>';
+      li++;
+      setTimeout(tick, 320);
+    }
+  }
+  if (reduced){
+    for (var i=0;i<script.length;i++){
+      var st = script[i];
+      out += st.t === "cmd" ? '<span class="pr">$ </span><span class="cm">'+st.s+'</span>' : '<span class="'+st.t+'">'+st.s+'</span>';
+    }
+    el.innerHTML = out;
+  } else tick();
+})();
+
+/* ── supersession demo ────────────────────────────────── */
+(function(){
+  var store = document.getElementById("store");
+  var receipt = document.getElementById("receipt");
+  var b1 = document.getElementById("s1"), b2 = document.getElementById("s2");
+  var b3 = document.getElementById("s3"), b4 = document.getElementById("s4");
+  var rs = document.getElementById("reset");
+  if (!store) return;
+
+  var mem = [];
+  function paint(){
+    if (!mem.length){ store.innerHTML = '<p style="font-size:12.5px;color:var(--ghost)">empty</p>'; return; }
+    store.innerHTML = mem.map(function(m){
+      return '<div class="mem '+(m.old?"old":"now")+'">' +
+             '<span class="when">'+m.when+' · '+(m.old?"superseded":"current")+'</span><br>' + m.text +
+             (m.why && !m.old ? '<span class="why">because '+m.why+'</span>' : '') + '</div>';
+    }).join("");
+  }
+  function arm(btn,on){ btn.disabled = !on; btn.classList.toggle("armed", on); }
+
+  b1.onclick = function(){
+    mem = [{when:"2026-01-10", text:"We use MongoDB for session storage"}];
+    paint();
+    receipt.innerHTML = '<span class="k">op</span>        ingest\n<span class="k">fact_key</span>  topic_session_storage\n<span class="k">status</span>    <span class="s">current</span>';
+    arm(b1,false); arm(b2,true);
+  };
+  b2.onclick = function(){
+    mem[0].old = true;
+    mem.push({when:"2026-02-02", text:"We switched to Redis for session storage", why:"Atlas kept timing out"});
+    paint();
+    receipt.innerHTML = '<span class="k">op</span>          ingest\n<span class="k">supersedes</span>  session_store_v1\n<span class="k">reason</span>      <span class="h">Atlas kept timing out</span>\n<span class="k">status</span>      <span class="s">current</span>';
+    arm(b2,false); arm(b3,true);
+  };
+  b3.onclick = function(){
+    receipt.innerHTML = '<span class="k">op</span>       recall\n<span class="k">sources</span>  <span class="s">[0] current     Redis</span>\n         <span class="k">[1] superseded  MongoDB</span>\n<span class="k">tokens</span>   2,235  <span class="k">(46.2x smaller)</span>\n<span class="k">abstained</span> false';
+    arm(b3,false); arm(b4,true);
+  };
+  b4.onclick = function(){
+    receipt.innerHTML = '<span class="k">op</span>      why\n\n  2026-01-10  MongoDB\n  2026-02-02  <span class="s">Redis</span>\n              <span class="h">because Atlas kept timing out</span>';
+    arm(b4,false);
+  };
+  rs.onclick = function(){
+    mem = []; paint();
+    receipt.innerHTML = '<span style="color:var(--ghost)">nothing yet</span>';
+    arm(b1,true); arm(b2,false); arm(b3,false); arm(b4,false);
+  };
+})();
+
+/* ── compression pixel field ──────────────────────────── */
+(function(){
+  var c = document.getElementById("compcanvas");
+  if (!c) return;
+  var V = fit(c);
+  var mx = -9999, my = -9999;
+  c.addEventListener("mousemove", function(e){
+    var r = c.getBoundingClientRect(); mx = e.clientX-r.left; my = e.clientY-r.top;
+  });
+  c.addEventListener("mouseleave", function(){ mx = -9999; my = -9999; });
+  addEventListener("resize", function(){ V = fit(c); });
+
+  function draw(){
+    var ctx = V.ctx, S = 5, PAD = 22;
+    ctx.clearRect(0,0,V.w,V.h);
+    var cols = Math.floor((V.w-PAD*2)/S), rows = Math.floor((V.h-PAD*2)/S);
+    var total = cols*rows;
+    var packCount = Math.max(6, Math.round(total/46.2));
+    for (var i=0;i<total;i++){
+      var cx = PAD + (i%cols)*S, cy = PAD + Math.floor(i/cols)*S;
+      var isPack = i % 46 === 0;
+      var dx = cx-mx, dy = cy-my, d = Math.sqrt(dx*dx+dy*dy);
+      var lift = d < 90 ? (1-d/90) : 0;
+      if (isPack){
+        ctx.globalAlpha = 0.85 + lift*0.15;
+        ctx.fillStyle = "#DFD8CB";
+      } else {
+        ctx.globalAlpha = 0.30 + lift*0.55;
+        ctx.fillStyle = lift > 0.55 ? "#E4572E" : "#312E29";
+      }
+      ctx.fillRect(cx, cy, S-1, S-1);
+    }
+    ctx.globalAlpha = 1;
+    requestAnimationFrame(draw);
+  }
+  draw();
+})();
+
+/* ── context graph ────────────────────────────────────── */
+(function(){
+  var c = document.getElementById("graphcanvas");
+  if (!c) return;
+  var V = fit(c), t0 = performance.now();
+  addEventListener("resize", function(){ V = fit(c); });
+
+  var N = [
+    {x:.15,y:.34,l:"session storage",dies:true},
+    {x:.38,y:.20,l:"test runner"},
+    {x:.36,y:.68,l:"deploy target"},
+    {x:.62,y:.44,l:"Redis",repl:true},
+    {x:.84,y:.24,l:"handoff"},
+    {x:.80,y:.72,l:"error tracking"}
+  ];
+  var L = [[0,1],[0,2],[1,4],[2,5],[3,4],[3,5]];
+  function P(n){ return {x:n.x*V.w, y:n.y*V.h}; }
+
+  function draw(now){
+    var ctx = V.ctx, t = reduced ? 9000 : (now-t0)%12000;
+    ctx.clearRect(0,0,V.w,V.h);
+    ctx.fillStyle = "#000"; ctx.fillRect(0,0,V.w,V.h);
+
+    var app = Math.min(1,t/1800), lk = Math.max(0,Math.min(1,(t-1600)/1600)), sw = Math.max(0,Math.min(1,(t-3800)/1800));
+
+    ctx.strokeStyle = "rgba(223,216,203,.13)"; ctx.lineWidth = 1;
+    for (var i=0;i<L.length;i++){
+      var f = Math.max(0,Math.min(1, lk*L.length - i)); if (f<=0) continue;
+      var a = P(N[L[i][0]]), b = P(N[L[i][1]]);
+      ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(a.x+(b.x-a.x)*f, a.y+(b.y-a.y)*f); ctx.stroke();
+    }
+
+    if (sw>0){
+      var s = P(N[0]), e = P(N[3]);
+      ctx.strokeStyle = "#E4572E"; ctx.lineWidth = 1.7;
+      ctx.beginPath(); ctx.moveTo(s.x,s.y); ctx.lineTo(s.x+(e.x-s.x)*sw, s.y+(e.y-s.y)*sw); ctx.stroke();
+      if (sw>.95){
+        ctx.fillStyle="rgba(228,87,46,.95)"; ctx.font="10px 'JetBrains Mono',monospace"; ctx.textAlign="center";
+        ctx.fillText("because Atlas kept timing out",(s.x+e.x)/2,(s.y+e.y)/2-11);
+      }
+    }
+
+    for (var k=0;k<N.length;k++){
+      var n = N[k], p = P(n);
+      var f2 = Math.max(0,Math.min(1, app*N.length - k)); if (f2<=0) continue;
+      var dead = n.dies && sw>.5, sz = (n.repl||k===0?10:7)*f2;
+      ctx.globalAlpha = dead? .45 : 1;
+      if (dead){ ctx.strokeStyle="#8B857A"; ctx.lineWidth=1.4; ctx.strokeRect(p.x-sz/2,p.y-sz/2,sz,sz); }
+      else { ctx.fillStyle="#DFD8CB"; ctx.fillRect(p.x-sz/2,p.y-sz/2,sz,sz); }
+      ctx.globalAlpha = dead? .4 : .75;
+      ctx.fillStyle="#DFD8CB"; ctx.font="10px 'JetBrains Mono',monospace"; ctx.textAlign="center";
+      ctx.fillText(n.l, p.x, p.y+sz+15);
+      ctx.globalAlpha = 1;
+    }
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+})();
+
+/* ── install tabs ─────────────────────────────────────── */
+(function(){
+  var PANELS = {
+    claude: '<span class="k">.mcp.json</span>\n{\n  "mcpServers": {\n    "lorex": {\n      "command": <span class="v">"lorex"</span>,\n      "args": [<span class="v">"start"</span>, <span class="v">"--workspace"</span>, <span class="v">"checkout"</span>]\n    }\n  }\n}',
+    cursor: '<span class="k">Cursor / Windsurf — MCP settings</span>\n{\n  "mcpServers": {\n    "lorex": {\n      "command": <span class="v">"lorex"</span>,\n      "args": [<span class="v">"start"</span>, <span class="v">"--workspace"</span>, <span class="v">"checkout"</span>]\n    }\n  }\n}',
+    codex:  '<span class="k">~/.codex/config.toml</span>\n[mcp_servers.lorex]\ncommand = <span class="v">"lorex"</span>\nargs = [<span class="v">"start"</span>, <span class="v">"--workspace"</span>, <span class="v">"checkout"</span>]',
+    cli:    '<span class="k"># any terminal, same store</span>\nlorex resume                      <span class="k">what the last agent left you</span>\nlorex why --factId session_store  <span class="k">why a value changed</span>\nlorex graph --live                <span class="k">live graph in a browser</span>\nlorex doctor                      <span class="k">check the connection</span>'
+  };
+  var panel = document.getElementById("panel");
+  var tabs = [].slice.call(document.querySelectorAll(".tab"));
+  function show(key){
+    panel.innerHTML = PANELS[key];
+    tabs.forEach(function(t){ t.setAttribute("aria-selected", String(t.dataset.tab === key)); });
+  }
+  tabs.forEach(function(t){ t.addEventListener("click", function(){ show(t.dataset.tab); }); });
+  show("claude");
+})();
+
+/* ── FAQ accordion ────────────────────────────────────── */
+[].slice.call(document.querySelectorAll(".faq-q")).forEach(function(q){
+  q.addEventListener("click", function(){
+    q.parentElement.classList.toggle("open");
+  });
+});
+
+/* ── footer dither field ──────────────────────────────── */
+(function(){
+  var c = document.getElementById("dither");
+  if (!c) return;
+  var V = fit(c), S = 8;
+  var mx = -9999, my = -9999;
+  c.addEventListener("mousemove", function(e){
+    var r = c.getBoundingClientRect(); mx = e.clientX-r.left; my = e.clientY-r.top;
+  });
+  c.addEventListener("mouseleave", function(){ mx = -9999; my = -9999; });
+  addEventListener("resize", function(){ V = fit(c); });
+
+  function draw(){
+    var ctx = V.ctx, t = performance.now()/1000;
+    ctx.clearRect(0,0,V.w,V.h);
+    for (var y=S/2; y<V.h; y+=S){
+      for (var x=S/2; x<V.w; x+=S){
+        /* ordered-dither threshold: density falls toward the top */
+        var bayer = ((x/S|0)%2 === (y/S|0)%2) ? 0.62 : 0.30;
+        var grad = y/V.h;
+        var on = (bayer + Math.sin(t*0.4 + x*0.05)*0.04) < grad*0.9 + 0.12;
+        var dx = x-mx, dy = y-my, d = Math.sqrt(dx*dx+dy*dy);
+        var hot = d < 110 ? 1-d/110 : 0;
+        if (!on && hot < 0.25) continue;
+        if (hot > 0.45){ ctx.fillStyle = "#E4572E"; ctx.globalAlpha = 0.5+hot*0.5; }
+        else { ctx.fillStyle = "#DFD8CB"; ctx.globalAlpha = on ? 0.22 : hot*0.6; }
+        ctx.fillRect(x-S/2, y-S/2, S-1, S-1);
+      }
+    }
+    ctx.globalAlpha = 1;
+    requestAnimationFrame(draw);
+  }
+  if (reduced){
+    V.ctx.fillStyle = "#DFD8CB"; V.ctx.globalAlpha = .15;
+    for (var y=0; y<V.h; y+=S) for (var x=((y/S)%2)*S; x<V.w; x+=S*2) V.ctx.fillRect(x,y,S-1,S-1);
+  } else draw();
+})();
+
+/* ── copy buttons ─────────────────────────────────────── */
+[].slice.call(document.querySelectorAll("[data-copy]")).forEach(function(b){
+  b.addEventListener("click", function(){
+    navigator.clipboard.writeText(b.dataset.copy).then(function(){
+      var was = b.textContent; b.textContent = "copied";
+      setTimeout(function(){ b.textContent = was; }, 1500);
+    }).catch(function(){});
+  });
+});
+})();
+</script>
+</body>
+</html>
