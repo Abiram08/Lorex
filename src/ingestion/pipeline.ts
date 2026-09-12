@@ -5,7 +5,7 @@ import type { NormalizedSession } from "../domain/session.js";
 import { sessionToEvents } from "./normalizer.js";
 import { chunkEvents, DEFAULT_CHUNK_TOKENS, type Chunk } from "./chunker.js";
 import { deduplicateEvents } from "./deduplicator.js";
-import { extractFacts, type ExtractedFact } from "./extractor.js";
+import { extractFacts, extractFactsWithLlm, llmExtractionEnabled, type ExtractedFact } from "./extractor.js";
 import { extractReason, extractTransition } from "../domain/causality.js";
 import { LIMITS, assertMaxLength } from "../infrastructure/limits.js";
 import { METADATA_SCHEMA_VERSION } from "../domain/receipts.js";
@@ -54,7 +54,15 @@ export async function ingestSession(
     maxTokens: options.maxTokensPerChunk ?? DEFAULT_CHUNK_TOKENS,
   });
 
-  const facts = extractFacts(uniqueEvents);
+  let facts = extractFacts(uniqueEvents);
+  // Tier 1 (opt-in): merge LLM-extracted facts under the heuristic baseline.
+  if (llmExtractionEnabled()) {
+    try {
+      facts = await extractFactsWithLlm(uniqueEvents, facts);
+    } catch {
+      // Heuristic results stand on their own.
+    }
+  }
 
   let knowledgeIds: string[] = [];
   let memoryIds: string[] = [];

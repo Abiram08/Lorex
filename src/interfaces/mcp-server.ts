@@ -36,6 +36,8 @@ const RecallSchema = z.object({
   type: z.enum(["memory", "knowledge", "all"]).optional(),
   maxResults: z.number().int().min(1).max(LIMITS.maxResults).optional(),
   abstainOnAmbiguity: z.boolean().optional(),
+  synthesize: z.boolean().optional(),
+  verify: z.enum(["off", "auto", "llm"]).optional(),
   maxTokens: z.number().int().min(256).max(LIMITS.maxContextTokens).optional()
     .describe(
       `Context pack budget in tokens. Hard cap ${LIMITS.maxContextTokens}; default ${LIMITS.defaultContextTokens}. ` +
@@ -115,6 +117,17 @@ export function createServer(engine: LorexEngine): Server {
               type: "boolean",
               description:
                 "Also decline when two near-equally-scored values compete (default: flag only, do not abstain).",
+            },
+            synthesize: {
+              type: "boolean",
+              description:
+                "Generate a grounded answer with [n] citations from the pack via the configured LOREX_LLM_BASE_URL endpoint. Falls back to deterministic synthesis when unset or unavailable.",
+            },
+            verify: {
+              type: "string",
+              enum: ["off", "auto", "llm"],
+              description:
+                "Post-retrieval support verification before answering. auto = deterministic answer-type entailment (default); llm = adds a cheap yes/no support judgment on the top sources; off disables.",
             },
           },
           additionalProperties: false,

@@ -199,7 +199,7 @@ export function extractAtomicValue(text: string): string {
   const trimmed = text.trim();
   if (trimmed.length <= 280) return trimmed;
 
-  const sentences = trimmed.split(/(?<=[.!?])\s+/);
+  const sentences = trimmed.split(/(?<=[.!?？。！])\s+/u);
   for (const s of sentences) {
     if (detectDurableSentence(s)) return s.trim().slice(0, 400);
   }

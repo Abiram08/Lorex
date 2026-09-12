@@ -32,13 +32,19 @@ import {
 } from "./domain/causality.js";
 import { retrieve } from "./retrieval/hydradb-retriever.js";
 import { assembleEvidence, synthesizeTimeline, synthesizeAnswer } from "./retrieval/evidence-assembler.js";
-import { determineAbstention } from "./synthesis/abstention.js";
+import { determineAbstention, MIN_LEXICAL_RELEVANCE_AGGREGATE } from "./synthesis/abstention.js";
+import {
+  resolveSynthesisConfig,
+  synthesizeGroundedAnswer,
+} from "./synthesis/llm-synthesizer.js";
+import { verifyPackSupport, llmVerifySupport, type VerifyTier } from "./synthesis/verify.js";
 import { classifyAndPlan } from "./retrieval/planner.js";
 import { ingestSession as runSessionIngestion, type FactIndex } from "./ingestion/pipeline.js";
+import { llmExtractionEnabled } from "./ingestion/extractor.js";
 import type { NormalizedSession } from "./domain/session.js";
 import { LIMITS, assertMaxLength, clampInt } from "./infrastructure/limits.js";
 import { HydraDBError } from "./infrastructure/hydradb-client.js";
-import { RateLimiter } from "./infrastructure/rate-limiter.js";
+import { RateLimiter, RateLimitError } from "./infrastructure/rate-limiter.js";
 import { computeCompression, resolveContextBudget } from "./domain/compression.js";
 import { countTokens } from "./ingestion/token-counter.js";
 
@@ -66,6 +72,13 @@ export interface RecallOpts {
   snapshot?: boolean;
   minRelevance?: number;
   abstainOnAmbiguity?: boolean;
+  /** Opt-in: synthesize a grounded answer with [n] citations via the
+   * LOREX_LLM_BASE_URL endpoint. Falls back to deterministic synthesis. */
+  synthesize?: boolean;
+  /** Post-retrieval support verification: "auto" (deterministic answer-type
+   * entailment, default), "llm" (adds a cheap yes/no judgment on top-3
+   * sources when an endpoint is configured), or "off". */
+  verify?: VerifyTier;
 }
 
 export class LorexEngine {
@@ -205,12 +218,16 @@ export class LorexEngine {
     } = {},
   ): Promise<import("./ingestion/pipeline.js").IngestionResult> {
     await this.ensureReady();
-    this.limiter.acquire("write");
     const estimatedTokens = session.turns.reduce(
       (sum, t) => sum + countTokens(t.content),
       0,
     );
+    // Check the token budget before consuming the write slot so a rejected
+    // ingest doesn't burn a write from the hourly/daily quota.
     this.limiter.acquire("ingest_tokens", estimatedTokens);
+    this.limiter.acquire("write");
+    // LLM extraction (LOREX_EXTRACT=llm) bills against the synthesis budget.
+    if (llmExtractionEnabled()) this.limiter.acquire("synth");
     const scoped: NormalizedSession = {
       ...session,
       database: this.identity.database,
@@ -570,38 +587,93 @@ export class LorexEngine {
       ? filterByAsOf(liveChunks, plan.asOf)
       : resolveCurrentVersions(liveChunks);
 
-    const disputes = detectDisputes(temporallyFiltered);
+    // An asOf window that filters out EVERYTHING is more likely an over-tight
+    // window than a truly empty history — degrade to the unfiltered set
+    // (temporal status stays visible on the sources) rather than abstaining
+    // on zero evidence.
+    const asOfEmptiedPack =
+      !!plan.asOf && temporallyFiltered.length === 0 && liveChunks.length > 0;
+    const effective = asOfEmptiedPack ? liveChunks : temporallyFiltered;
 
-    const assembled = assembleEvidence(temporallyFiltered, {
+    const disputes = detectDisputes(effective);
+
+    const assembled = assembleEvidence(effective, {
       maxTokens,
       chronological: plan.requireChronology,
       preferCompact: true,
       preferCurrent: !plan.asOf && !plan.requireChronology,
     });
 
-    const abstention = determineAbstention(temporallyFiltered, {
+    const abstention = determineAbstention(effective, {
       asOf: plan.asOf,
       unavailable,
       query: opts.query,
       minScore: opts.snapshot ? 0 : undefined,
-      minRelevance: opts.snapshot ? 0 : opts.minRelevance,
+      minRelevance:
+        opts.snapshot ? 0
+          : opts.minRelevance
+            ?? (plan.requireChronology ? MIN_LEXICAL_RELEVANCE_AGGREGATE : undefined),
       abstainOnAmbiguity:
         opts.abstainOnAmbiguity ?? process.env.LOREX_ABSTAIN_ON_AMBIGUITY === "1",
     });
 
+    // Cite-or-abstain verification: lexical gates can pass on shared
+    // vocabulary alone; this checks that the pack actually entails an answer.
+    if (!abstention.abstained) {
+      const verdict = verifyPackSupport(opts.query ?? "", assembled.evidence, {
+        tier: opts.verify ?? "auto",
+      });
+      if (!verdict.supported) {
+        abstention.abstained = true;
+        abstention.reason = "unsupported_claim";
+      } else if (verdict.tier === "answer_type" && (opts.verify ?? "auto") === "llm") {
+        const cfg = resolveSynthesisConfig();
+        if (cfg) {
+          const llmOk = await llmVerifySupport(opts.query!, assembled.evidence, cfg);
+          if (llmOk === false) {
+            abstention.abstained = true;
+            abstention.reason = "unsupported_claim";
+          }
+        }
+      }
+    }
+
     const compression = computeCompression(assembled.totalTokens, measuredHaystack);
 
-    const answer = abstention.abstained
+    let answer = abstention.abstained
       ? undefined
       : plan.requireChronology
         ? synthesizeTimeline(assembled.evidence)
         : synthesizeAnswer(assembled.evidence, opts.query);
+
+    let synthesis: import("./domain/receipts.js").SynthesisInfo | undefined;
+    if (opts.synthesize && !abstention.abstained && opts.query) {
+      const cfg = resolveSynthesisConfig();
+      if (cfg) {
+        try {
+          this.limiter.acquire("synth");
+          const s = await synthesizeGroundedAnswer(opts.query, assembled.evidence, cfg);
+          answer = s.answer;
+          synthesis = {
+            model: s.model,
+            cited_sources: s.citedIds,
+            dropped_claims: s.droppedClaims,
+          };
+        } catch (e) {
+          if (e instanceof RateLimitError) throw e;
+          // Deterministic answer stays; synthesis is best-effort by design.
+        }
+      }
+    }
 
     const packLine = abstention.abstained
       ? `Abstained (${abstention.reason}): ${getAbstentionMessage(abstention.reason)}`
       : compression.haystack_measured
         ? `Retrieved ${assembled.evidence.length} sources · ${assembled.totalTokens} tokens (${compression.context_pct}% of ${compression.haystack_tokens.toLocaleString()}-token history, ${compression.compression_ratio}× smaller)`
         : `Retrieved ${assembled.evidence.length} sources · ${assembled.totalTokens} tokens`;
+    const summaryLine = asOfEmptiedPack
+      ? `${packLine} ⚠ asOf window matched nothing directly; showing unfiltered history`
+      : packLine;
 
     return {
       op: "recall",
@@ -616,12 +688,14 @@ export class LorexEngine {
       unavailable,
       as_of: plan.asOf,
       summary: disputes.length
-        ? `${packLine} ⚠ ${disputes.length} disputed topic(s): ${disputes.map((d) => d.factKey).join(", ")}`
-        : packLine,
+        ? `${summaryLine} ⚠ ${disputes.length} disputed topic(s): ${disputes.map((d) => d.factKey).join(", ")}`
+        : summaryLine,
       answer,
       disputes: disputes.length ? disputes : undefined,
       context: assembled.evidence.map((e) => `[${e.id}] ${e.excerpt}`).join("\n"),
       compression,
+      synthesis,
+      result: synthesis ? { synthesis } : undefined,
     };
   }
 
@@ -751,7 +825,7 @@ export class LorexEngine {
     const explained = chains.filter((c) => c.hasReasons).length;
 
     return {
-      op: "history",
+      op: "why",
       sources: versions.map((c) => this.toSource(c)),
       mode_used: "thinking",
       request_id: result.requestId,
@@ -1231,7 +1305,10 @@ function detectSupersessionConflicts(chunks: QueryChunk[]): Array<{ type: string
 
   const currentVersions = chunks.filter((c) => {
     const md = c.metadata as Record<string, unknown> | undefined;
-    return md?.status === "current" || (!md?.valid_to && md?.status !== "superseded" && md?.status !== "forgotten");
+    // Only versions carrying the full metadata schema participate; chunks
+    // without fact_key/version_id are not part of any supersession chain.
+    if (!md?.fact_key || !md?.version_id) return false;
+    return md.status === "current" || (!md.valid_to && md.status !== "superseded" && md.status !== "forgotten");
   });
   const byKey = new Map<string, string[]>();
   for (const c of currentVersions) {
@@ -1263,6 +1340,8 @@ function getAbstentionMessage(reason?: AbstentionReason): string {
       return "Multiple equally-relevant results found (ambiguous).";
     case "evidence_not_relevant":
       return "Retrieved text does not appear to answer the query.";
+    case "unsupported_claim":
+      return "No retrieved source actually contains the requested information.";
     default:
       return "Unable to retrieve a reliable answer.";
   }

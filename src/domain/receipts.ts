@@ -14,7 +14,17 @@ export type AbstentionReason =
   | "unavailable"
   | "contradictory_evidence"
   | "ambiguous_entity"
-  | "evidence_not_relevant";
+  | "evidence_not_relevant"
+  | "unsupported_claim";
+
+/** Audit record for an LLM-synthesized answer. */
+export interface SynthesisInfo {
+  model: string;
+  /** Source ids whose citations survived the grounding post-check. */
+  cited_sources: string[];
+  /** Sentences dropped because their citations did not resolve. */
+  dropped_claims: string[];
+}
 
 export interface ReceiptSource {
   id: string;
@@ -33,7 +43,7 @@ export interface ReceiptSource {
 }
 
 export interface Receipt<T = unknown> {
-  op: "recall" | "ingest" | "feedback" | "history" | "list" | "forget" | "usage";
+  op: "recall" | "ingest" | "feedback" | "history" | "why" | "list" | "forget" | "usage";
   result?: T;
   sources: ReceiptSource[];
   mode_used: ModeUsed;
@@ -50,5 +60,6 @@ export interface Receipt<T = unknown> {
   answer?: string;
   context?: string;
   compression?: CompressionStats;
+  synthesis?: SynthesisInfo;
   disputes?: Array<{ factKey: string; versionIds: string[]; values: string[] }>;
 }

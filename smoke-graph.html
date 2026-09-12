@@ -1,50 +1,9 @@
-/** Context graph rendered as a self-contained HTML page. */
-
-import type { ContextGraph } from "../domain/graph.js";
-
-export interface RenderOptions {
-  workspace?: string;
-  database: string;
-  collection: string;
-  query?: string;
-  liveUrl?: string;
-  pollMs?: number;
-  /** Publish mode: strip node detail text (raw fact content) so only
-   * structure — labels, edges, reasons, agents — leaves the machine. */
-  redacted?: boolean;
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function payload(graph: ContextGraph, redacted?: boolean): string {
-  const out = redacted
-    ? {
-        ...graph,
-        nodes: graph.nodes.map((n) => ({ ...n, detail: undefined })),
-      }
-    : graph;
-  return JSON.stringify(out).replace(/</g, "\\u003c");
-}
-
-export function renderGraphHtml(graph: ContextGraph, meta: RenderOptions): string {
-  const scope = meta.workspace ? meta.workspace : meta.collection;
-  const title = `Context graph — ${scope}`;
-  const live = meta.liveUrl ? JSON.stringify(meta.liveUrl) : "null";
-  const pollMs = meta.pollMs ?? 2000;
-
-  return `<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(title)}</title>
+<title>Context graph — repo_8bc9a7b820b8</title>
 <style>
   :root {
     --bg:#000000;
@@ -143,9 +102,9 @@ export function renderGraphHtml(graph: ContextGraph, meta: RenderOptions): strin
 
 <div class="overlay">
   <header>
-    <h1>Context graph · <span class="scope">${escapeHtml(scope)}</span></h1>
-    <span class="meta">${escapeHtml(meta.database)}</span>
-    ${meta.query ? `<span class="q">“${escapeHtml(meta.query)}”</span>` : ""}
+    <h1>Context graph · <span class="scope">repo_8bc9a7b820b8</span></h1>
+    <span class="meta">user_4cdfbb8aaf9c</span>
+    
   </header>
 </div>
 
@@ -173,9 +132,9 @@ export function renderGraphHtml(graph: ContextGraph, meta: RenderOptions): strin
 <script>
 (function(){
 "use strict";
-var LIVE = ${live};
-var POLL = ${pollMs};
-var graph = ${payload(graph, meta.redacted)};
+var LIVE = null;
+var POLL = 2000;
+var graph = {"nodes":[],"edges":[],"stats":{"facts":0,"superseded":0,"handoffs":0,"entities":0,"chunks":0,"agents":[],"explainedChanges":0,"totalChanges":0}};
 
 var COLOR = {
   fact:"#2ee6c5", superseded:"#4a5654", handoff:"#c8a2ff",
@@ -451,5 +410,4 @@ function renderStatsFrom(next){ graph.stats = next.stats; renderStats(); }
 })();
 </script>
 </body>
-</html>`;
-}
+</html>

@@ -57,9 +57,9 @@ async function cmdInit(): Promise<void> {
       existing = null;
     }
 
-    println("  Step 1 of 3 — Connect HydraDB");
-    println("  Lorex stores memory in your own HydraDB database. You bring the key.");
-    println("  Get one at https://hydradb.com");
+    println("  Step 1 of 3 — Cloud sync (optional)");
+    println("  Lorex works locally with no key. Add one later for multi-machine sync.");
+    println("  Get one at https://hydradb.com — or leave blank to stay local.");
     println();
 
     let apiKey = existing?.apiKey ?? "";
@@ -69,12 +69,10 @@ async function cmdInit(): Promise<void> {
       if (replace.toLowerCase().startsWith("y")) apiKey = "";
     }
     if (!apiKey) {
-      apiKey = await prompt(rl, "  HydraDB API key: ");
+      apiKey = await prompt(rl, "  HydraDB API key [blank = local-only]: ");
       if (!apiKey) {
-        println("\n  No key entered. Run `lorex init` again when you have one.");
-        println("  Everything works offline meanwhile — add --mock to any command.\n");
-        process.exitCode = 1;
-        return;
+        println("\n  Staying local-only. Everything works offline in ~/.lorex/.");
+        println("  Run `lorex init` again any time to add cloud sync.\n");
       }
     }
 
@@ -96,20 +94,24 @@ async function cmdInit(): Promise<void> {
 
     println();
     println("  Verifying…");
-    const client = new HydraDBClient({ apiKey, baseUrl, timeoutMs: 8_000, queueCap: 500 });
-    const probe = await Promise.race([
-      client.ping(slugWorkspace(workspace)),
-      new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
-    ]);
-
-    if (!probe) {
-      println("  [??] No response within 20s. Setup is saved; run `lorex doctor` to retry.");
-    } else if (probe.authed && probe.reachable) {
-      println(`  [ok] HydraDB reachable and authenticated (${probe.latencyMs}ms).`);
-    } else if (!probe.authed) {
-      println("  [!!] Key rejected. Check it and run `lorex init` again.");
+    if (!apiKey.trim()) {
+      println("  [ok] Local store ready (~/.lorex/mock-store.json). No network needed.");
     } else {
-      println(`  [!!] Could not reach ${baseUrl}: ${probe.error ?? "unknown error"}`);
+      const client = new HydraDBClient({ apiKey, baseUrl, timeoutMs: 8_000, queueCap: 500 });
+      const probe = await Promise.race([
+        client.ping(slugWorkspace(workspace)),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
+      ]);
+
+      if (!probe) {
+        println("  [??] No response within 20s. Setup is saved; run `lorex doctor` to retry.");
+      } else if (probe.authed && probe.reachable) {
+        println(`  [ok] HydraDB reachable and authenticated (${probe.latencyMs}ms).`);
+      } else if (!probe.authed) {
+        println("  [!!] Key rejected. Check it and run `lorex init` again.");
+      } else {
+        println(`  [!!] Could not reach ${baseUrl}: ${probe.error ?? "unknown error"}`);
+      }
     }
 
     println();
@@ -150,7 +152,10 @@ function identityFrom(args: string[], config: Config) {
 }
 
 function buildClient(useMock: boolean, config: Config): HydraDBLike {
-  if (useMock) {
+  // Local-first: default to the local store. Cloud (HydraDB) is opt-in only
+  // when a key is configured AND --cloud is passed. --mock is kept as an alias.
+  const wantsCloud = !useMock && (config.apiKey?.trim() ?? "") !== "" && process.argv.includes("--cloud");
+  if (!wantsCloud) {
     return new MockHydraDB({ persistPath: join(lorexHome(), "mock-store.json") });
   }
   return new HydraDBClient(config);
@@ -295,6 +300,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         type: flag("--type") as "memory" | "knowledge" | "all" | undefined,
         maxResults: flag("--maxResults") ? Number(flag("--maxResults")) : undefined,
         abstainOnAmbiguity: args.includes("--abstainOnAmbiguity") || undefined,
+        synthesize: args.includes("--synthesize") || undefined,
       });
       break;
     }
@@ -337,7 +343,9 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
       }
 
       const { renderGraphHtml } = await import("./graph-render.js");
-      const { writeFileSync } = await import("node:fs");
+      const { writeFileSync, mkdirSync, existsSync, readFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const publish = args.includes("--publish");
       const out = flag("--out") ?? "lorex-graph.html";
       const { graph } = await engine.graph({ query: flag("--query"), maxResults });
       writeFileSync(out, renderGraphHtml(graph, {
@@ -345,15 +353,59 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         database: identity.database,
         collection: identity.collection,
         query: flag("--query"),
+        redacted: publish,
       }));
-      println(JSON.stringify({
-        op: "graph",
-        out,
+      if (!publish) {
+        println(JSON.stringify({
+          op: "graph",
+          out,
+          nodes: graph.nodes.length,
+          edges: graph.edges.length,
+          stats: graph.stats,
+          summary: `Wrote ${out} - ${graph.nodes.length} nodes, ${graph.edges.length} edges, ` +
+            `${graph.stats.explainedChanges}/${graph.stats.totalChanges} changes with a recorded reason.`,
+        }, null, 2));
+        return;
+      }
+
+      // --publish: register the snapshot in the local gallery. The HTML is
+      // fully self-contained (data baked in, no keys, no backend) — copy the
+      // directory to any static host and it just works.
+      const pubDir = flag("--publish-dir") ?? join(lorexHome(), "published");
+      mkdirSync(pubDir, { recursive: true });
+      const slug = `${identity.collection}-${Date.now().toString(36)}.html`;
+      const snapPath = join(pubDir, slug);
+      writeFileSync(snapPath, readFileSync(out, "utf8"));
+      const indexPath = join(pubDir, "index.json");
+      const entries = existsSync(indexPath)
+        ? JSON.parse(readFileSync(indexPath, "utf8") as string) as Array<Record<string, unknown>>
+        : [];
+      const entry = {
+        file: slug,
+        title: flag("--query") ?? identity.collectionLabel,
         nodes: graph.nodes.length,
         edges: graph.edges.length,
-        stats: graph.stats,
-        summary: `Wrote ${out} - ${graph.nodes.length} nodes, ${graph.edges.length} edges, ` +
-          `${graph.stats.explainedChanges}/${graph.stats.totalChanges} changes with a recorded reason.`,
+        publishedAt: new Date().toISOString(),
+      };
+      entries.unshift(entry);
+      writeFileSync(indexPath, JSON.stringify(entries.slice(0, 100), null, 2));
+      const galleryHtml =
+        `<!doctype html><meta charset="utf-8"><title>Lorex graph gallery</title>` +
+        `<body style="font-family:system-ui;max-width:640px;margin:3rem auto">` +
+        `<h1>Published context graphs</h1><ul>` +
+        entries.map((e) =>
+          `<li><a href="${String(e.file)}">${String(e.title)}</a> — ${e.nodes} nodes, ${e.edges} edges (${String(e.publishedAt).slice(0, 10)})</li>`,
+        ).join("") +
+        `</ul></body>`;
+      writeFileSync(join(pubDir, "index.html"), galleryHtml);
+      println(JSON.stringify({
+        op: "graph-publish",
+        out: snapPath,
+        gallery: join(pubDir, "index.html"),
+        nodes: graph.nodes.length,
+        edges: graph.edges.length,
+        summary: `Published snapshot with data baked in (read-only, no credentials). ` +
+          `Copy ${pubDir} to your static host (e.g. \`npx wrangler pages deploy ${pubDir}\` or \`gh-pages\`).`,
       }, null, 2));
       return;
     }
@@ -495,20 +547,21 @@ export async function runCli(argv: string[]): Promise<void> {
   }
 }
 
-const USAGE = `Lorex — agent memory and context layer on HydraDB.
+const USAGE = `Lorex — local-first agent memory and context layer.
 
 Usage:
-  lorex init                Configure HydraDB API key
-  lorex start [--mock]      Start MCP server
-  lorex doctor [--mock]     Verify setup
-  lorex usage [--mock]      Show rate-limit usage and queue status
-  lorex dashboard [--mock]  Local dashboard on 127.0.0.1:3000 (--port to change)
+  lorex init                Optional: workspace name + cloud sync key (works with no key)
+  lorex start [--cloud]     Start MCP server (local store by default)
+  lorex doctor [--cloud]    Verify setup
+  lorex usage [--cloud]     Show rate-limit usage and queue status
+  lorex dashboard [--cloud] Local dashboard on 127.0.0.1:3000 (--port to change)
 
 One-shot (JSON):
   lorex remember --fact "..." [--id id] [--because "..."] [--validFrom ISO] [--ttl s]
-  lorex recall [--query "..."] [--asOf ISO] [--mode fast|thinking]
+  lorex recall [--query "..."] [--asOf ISO] [--mode fast|thinking] [--synthesize]
   lorex why [--factId id] [--query "..."]      Why a decision changed
   lorex graph [--query "..."] [--out f.html]   Render the context graph
+  lorex graph --publish [--publish-dir dir]    Bake a shareable snapshot + gallery
   lorex graph --live [--port 4100]             Live graph that redraws as agents write
   lorex handoff --decision "..." [--next "..."] Hand work to the next agent
   lorex learn --content "..." [--sourceRef ref]
@@ -519,7 +572,7 @@ One-shot (JSON):
   lorex report --requestId id [--answer "..."] [--rating positive|negative|neutral]
   lorex capture --sessionId id --file turns.json [--startedAt ISO]
 
-All commands support --mock for offline testing.
+All commands run local-first (no key needed). Add --cloud to use HydraDB sync when configured.
 
 Shared memory across agents:
   --workspace <name>   Join a shared workspace. Every agent naming the same

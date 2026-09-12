@@ -34,6 +34,12 @@ export interface ResolvedProvider {
 }
 
 export function resolveProvider(): ResolvedProvider | null {
+  return resolveProviderChain()[0] ?? null;
+}
+
+/** Every configured provider, best-first. The benchmark rotates through these
+ * when one is rate-limited instead of dying mid-run. */
+export function resolveProviderChain(): ResolvedProvider[] {
   const forced = (process.env.LOREX_LLM_PROVIDER ?? "").trim().toLowerCase();
   const model = (process.env.LOREX_EVAL_MODEL ?? "").trim();
 
@@ -48,56 +54,80 @@ export function resolveProvider(): ResolvedProvider | null {
   ).trim();
 
   const wants = (p: string) => !forced || forced === p;
+  const chain: ResolvedProvider[] = [];
+  // A global LOREX_EVAL_MODEL may name a model only one provider hosts
+  // (e.g. "stealth/ox-alpha"). Apply it to OpenAI-compatible endpoints, which
+  // route by id; native-API providers keep their own defaults unless the id
+  // clearly belongs to them.
+  const looksGemini = /^gemini|^google\//i.test(model);
+  const looksAnthropic = /^claude/i.test(model);
 
+  // Order: explicitly-configured endpoints first (the user chose them
+  // deliberately), then free native tiers as failover, then metered last.
+
+  if (wants("openai-compatible") && customBase) {
+    const isOpenRouter = /openrouter\.ai/i.test(customBase);
+    const looksLikeLocalId = /^(llama|gemma|mixtral)/i.test(model);
+    chain.push({
+      provider: "openai-compatible",
+      model:
+        model && !(looksGemini && isOpenRouter)
+          ? model
+          : isOpenRouter
+            ? DEFAULT_OPENROUTER_MODEL
+            : looksLikeLocalId || !model
+              ? DEFAULT_MODELS["openai-compatible"]
+              : model,
+      apiKey: custom || "local",
+      baseUrl: customBase.replace(/\/+$/, ""),
+      metered: false,
+      label: isOpenRouter ? "OpenRouter" : `OpenAI-compatible (${customBase})`,
+    });
+  }
   if (wants("gemini") && gemini) {
-    return {
+    chain.push({
       provider: "gemini",
-      model: model || DEFAULT_MODELS.gemini,
+      model: looksGemini ? model : DEFAULT_MODELS.gemini,
       apiKey: gemini,
       metered: false,
       label: "Google AI Studio (free tier)",
-    };
+    });
   }
   if (wants("groq") && groq) {
-    return {
+    chain.push({
       provider: "openai-compatible",
-      model: model || DEFAULT_MODELS["openai-compatible"],
+      model: !model || looksGemini ? DEFAULT_MODELS["openai-compatible"] : model,
       apiKey: groq,
       baseUrl: "https://api.groq.com/openai/v1",
       metered: false,
       label: "Groq (free tier)",
-    };
-  }
-  if (wants("openai-compatible") && customBase) {
-    return {
-      provider: "openai-compatible",
-      model: model || DEFAULT_MODELS["openai-compatible"],
-      apiKey: custom || "local",
-      baseUrl: customBase.replace(/\/+$/, ""),
-      metered: false,
-      label: `OpenAI-compatible (${customBase})`,
-    };
+    });
   }
   if (wants("anthropic") && anthropic) {
-    return {
+    chain.push({
       provider: "anthropic",
-      model: model || DEFAULT_MODELS.anthropic,
+      model: looksAnthropic ? model : DEFAULT_MODELS.anthropic,
       apiKey: anthropic,
       metered: true,
       label: "Anthropic API (metered)",
-    };
+    });
   }
   if (wants("anthropic") && process.env.ANTHROPIC_PROFILE) {
-    return {
+    chain.push({
       provider: "anthropic",
       model: model || DEFAULT_MODELS.anthropic,
       apiKey: "",
       metered: true,
       label: "Anthropic API (profile)",
-    };
+    });
   }
-  return null;
+  return chain;
 }
+
+/** Sensible default for OpenRouter: Ox Alpha (stealth/ox-alpha) is free,
+ * 1M-context, and a strong reasoner — ideal judge/answer material. Fallback
+ * to the auto-router if it rotates away; override with LOREX_EVAL_MODEL. */
+export const DEFAULT_OPENROUTER_MODEL = "stealth/ox-alpha";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
@@ -111,8 +141,10 @@ export class LlmRefusalError extends Error {
 }
 
 export class EvalLlm {
-  private readonly cfg: ResolvedProvider;
-  private readonly anthropic: Anthropic | null;
+  private cfg: ResolvedProvider;
+  private readonly chain: ResolvedProvider[];
+  private readonly cooldownUntil = new Map<number, number>();
+  private anthropic: Anthropic | null;
   readonly model: string;
   readonly ledger: UsageLedger = {
     inputTokens: 0,
@@ -122,15 +154,42 @@ export class EvalLlm {
     estimatedCostUsd: 0,
   };
 
-  constructor(cfg?: ResolvedProvider) {
-    const resolved = cfg ?? resolveProvider();
-    if (!resolved) throw new Error("No LLM credentials found. See `resolveProvider`.");
-    this.cfg = resolved;
-    this.model = resolved.model;
-    this.anthropic =
-      resolved.provider === "anthropic"
-        ? new Anthropic(resolved.apiKey ? { apiKey: resolved.apiKey } : {})
-        : null;
+  constructor(cfg?: ResolvedProvider | ResolvedProvider[]) {
+    this.chain = cfg ? (Array.isArray(cfg) ? cfg : [cfg]) : resolveProviderChain();
+    if (this.chain.length === 0) {
+      throw new Error("No LLM credentials found. See `resolveProvider`.");
+    }
+    this.cfg = this.chain[0]!;
+    this.model = this.cfg.model;
+    this.anthropic = this.buildAnthropic(this.cfg);
+  }
+
+  private buildAnthropic(cfg: ResolvedProvider): Anthropic | null {
+    return cfg.provider === "anthropic"
+      ? new Anthropic(cfg.apiKey ? { apiKey: cfg.apiKey } : {})
+      : null;
+  }
+
+  /** First provider not in cooldown, or the one with the least waiting. */
+  private pickProvider(excludeFailed: boolean): { cfg: ResolvedProvider; index: number; waitMs: number } {
+    const now = Date.now();
+    let best = { waitMs: Number.POSITIVE_INFINITY, index: -1 };
+    for (let i = 0; i < this.chain.length; i++) {
+      if (excludeFailed && i === this.chain.indexOf(this.cfg)) continue;
+      const until = this.cooldownUntil.get(i) ?? 0;
+      if (until <= now) return { cfg: this.chain[i]!, index: i, waitMs: 0 };
+      if (until - now < best.waitMs) best = { waitMs: until - now, index: i };
+    }
+    if (!excludeFailed && best.index >= 0) {
+      return { cfg: this.chain[best.index]!, index: best.index, waitMs: best.waitMs };
+    }
+    // All cooling down and nothing else to try — stay on current.
+    return { cfg: this.cfg, index: this.chain.indexOf(this.cfg), waitMs: 0 };
+  }
+
+  private switchTo(index: number): void {
+    this.cfg = this.chain[index]!;
+    this.anthropic = this.buildAnthropic(this.cfg);
   }
 
   get label(): string {
@@ -162,9 +221,31 @@ export class EvalLlm {
         lastErr = e;
         if (e instanceof LlmRefusalError) throw e;
         const status = (e as { status?: number }).status;
-        const retryable = status === 429 || status === 408 || (status ?? 0) >= 500 || status === undefined;
-        if (!retryable || attempt === MAX_ATTEMPTS - 1) throw e;
+        const rateLimited = status === 429 || status === 402;
+        const retryable = rateLimited || status === 408 || (status ?? 0) >= 500 || status === undefined;
+        if (!retryable) throw e;
 
+        // Rate-limited: put this provider on cooldown and fail over to the
+        // next configured one instead of stalling the whole run.
+        if (rateLimited && this.chain.length > 1) {
+          const currentIdx = this.chain.indexOf(this.cfg);
+          const retryAfter = (e as { retryAfterMs?: number }).retryAfterMs;
+          this.cooldownUntil.set(
+            currentIdx,
+            Date.now() + Math.max(retryAfter ?? 60_000, 60_000),
+          );
+          const next = this.pickProvider(true);
+          if (next.index !== currentIdx) {
+            console.warn(
+              `lorex-bench: ${this.cfg.label} rate-limited — failing over to ${next.cfg.label}.`,
+            );
+            this.switchTo(next.index);
+            this.ledger.retries++;
+            continue; // retry immediately on the fresh provider, same attempt budget
+          }
+        }
+
+        if (attempt === MAX_ATTEMPTS - 1) throw e;
         const retryAfter = (e as { retryAfterMs?: number }).retryAfterMs;
         const backoff = retryAfter ?? Math.min(60_000, 2_000 * Math.pow(2, attempt));
         this.ledger.retries++;
@@ -181,7 +262,7 @@ export class EvalLlm {
     effort: "low" | "medium" | "high",
   ): Promise<string> {
     const res = await this.anthropic!.messages.create({
-      model: this.model,
+      model: this.cfg.model,
       max_tokens: maxTokens,
       output_config: { effort },
       ...(system ? { system } : {}),
@@ -267,7 +348,7 @@ export class EvalLlm {
         Authorization: `Bearer ${this.cfg.apiKey}`,
       },
       body: JSON.stringify({
-        model: this.model,
+        model: this.cfg.model,
         messages: [
           ...(system ? [{ role: "system", content: system }] : []),
           { role: "user", content: prompt },

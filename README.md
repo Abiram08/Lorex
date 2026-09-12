@@ -64,7 +64,7 @@ Windsurf, or Codex.
 
 | Tool | What it does |
 |------|--------------|
-| `recall` | Query memory (`asOf`, `mode`); returns the pack, compression stats, and abstention |
+| `recall` | Query memory (`asOf`, `mode`, opt-in `synthesize`); returns the pack, compression stats, and abstention |
 | `remember` | Store a fact — `id` for supersession, `because` for the causal reason |
 | `why` | Walk a fact's supersession chain and return the recorded reasons |
 | `handoff` | Record a decision and the next step for whichever agent comes next |
@@ -75,7 +75,6 @@ Windsurf, or Codex.
 | `forget` | Soft-delete a fact topic (confidence-gated) |
 | `report` | Send retrieval feedback back to HydraDB |
 | `capture_session` | Ingest a full chat session through the pipeline |
-| `usage` | Show rate-limit consumption and pending write queue |
 | `usage` | Show rate-limit consumption and pending write queue |
 
 ### From the shell
@@ -207,6 +206,8 @@ More detail:
 | `LOREX_ABSTAIN_ON_AMBIGUITY` | `1` makes recall decline when two values tie instead of flagging only |
 | `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `GROQ_API_KEY` | Benchmark judge |
 | `LOREX_EVAL_MODEL` | Judge model override |
+| `LOREX_LLM_BASE_URL` / `LOREX_LLM_API_KEY` | OpenAI-compatible endpoint (OpenRouter, Ollama) for the judge and for opt-in synthesis |
+| `LOREX_SYNTH_MODEL` | Model for opt-in `recall` answer synthesis (default `gpt-4o-mini`) |
 
 A `.env` file in the working directory is loaded for any variable not already
 set in the environment. See [.env.example](.env.example).

@@ -467,10 +467,26 @@ export class HydraDBClient implements HydraDBLike {
   }
 
   async awaitDatabaseReady(database: string, maxAttempts = 15, intervalMs = 1000): Promise<void> {
+    // Network blips must not kill an unattended run: only "not ready after N
+    // honest polls" is fatal. Transient fetch failures count against the
+    // budget but keep polling with backoff.
+    let lastNetworkError: unknown;
     for (let i = 0; i < maxAttempts; i++) {
-      const { ready } = await this.databaseStatus(database);
-      if (ready) return;
-      await sleep(intervalMs);
+      try {
+        const { ready } = await this.databaseStatus(database);
+        if (ready) return;
+      } catch (e) {
+        const kind = (e as { kind?: string }).kind;
+        if (kind === "auth" || kind === "client") throw e;
+        lastNetworkError = e;
+      }
+      await sleep(Math.min(intervalMs * (i + 1), 10_000));
+    }
+    if (lastNetworkError) {
+      throw new HydraDBError(
+        `HydraDB unreachable while waiting for "${database}": ${(lastNetworkError as Error).message}`,
+        "network",
+      );
     }
     throw new HydraDBError(`Database "${database}" not ready after ${maxAttempts} polls`, "not_ready");
   }

@@ -4,13 +4,16 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { lorexHome } from "./paths.js";
 
-export type OperationKind = "write" | "query" | "ingest_tokens";
+export type OperationKind = "write" | "query" | "ingest_tokens" | "synth";
 
 export interface RateLimits {
   writesPerHour: number;
   writesPerDay: number;
   queriesPerHour: number;
   ingestTokensPerDay: number;
+  /** Optional so persisted-config objects predating synthesis still typecheck;
+   * falls back to DEFAULT_LIMITS.synthPerHour. */
+  synthPerHour?: number;
 }
 
 export const DEFAULT_LIMITS: RateLimits = {
@@ -18,11 +21,13 @@ export const DEFAULT_LIMITS: RateLimits = {
   writesPerDay: 1_000,
   queriesPerHour: 240,
   ingestTokensPerDay: 2_000_000,
+  synthPerHour: 30,
 };
 
 const USAGE_FILE = (): string => join(lorexHome(), "usage.json");
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
+const SYNTH_FALLBACK = DEFAULT_LIMITS.synthPerHour ?? 30;
 
 export class RateLimitError extends Error {
   constructor(
@@ -47,6 +52,7 @@ export interface UsageState {
   writesToday: number;
   queriesThisHour: number;
   ingestTokensToday: number;
+  synthsThisHour: number;
 }
 
 function freshState(now: number): UsageState {
@@ -57,6 +63,7 @@ function freshState(now: number): UsageState {
     writesToday: 0,
     queriesThisHour: 0,
     ingestTokensToday: 0,
+    synthsThisHour: 0,
   };
 }
 
@@ -64,7 +71,9 @@ function isUnlimited(limits: RateLimits): boolean {
   return (
     limits.writesPerHour >= Number.MAX_SAFE_INTEGER ||
     limits.writesPerDay >= Number.MAX_SAFE_INTEGER ||
-    limits.queriesPerHour >= Number.MAX_SAFE_INTEGER
+    limits.queriesPerHour >= Number.MAX_SAFE_INTEGER ||
+    limits.ingestTokensPerDay >= Number.MAX_SAFE_INTEGER ||
+    (limits.synthPerHour ?? SYNTH_FALLBACK) >= Number.MAX_SAFE_INTEGER
   );
 }
 
@@ -120,6 +129,21 @@ export class RateLimiter {
       return;
     }
 
+    if (kind === "synth") {
+      const cap = this.limits.synthPerHour ?? SYNTH_FALLBACK;
+      if (s.synthsThisHour + amount > cap) {
+        throw new RateLimitError(
+          `Lorex synthesis limit reached (${cap}/hour). ` +
+            `Resets in ${this.resetIn(s.hourStartedAt + HOUR_MS)}s. ` +
+            "Raise it via LOREX_MAX_SYNTH_PER_HOUR or skip synthesize:true.",
+          kind,
+          s.hourStartedAt + HOUR_MS,
+          cap,
+        );
+      }
+      return;
+    }
+
     if (s.ingestTokensToday + amount > this.limits.ingestTokensPerDay) {
       throw new RateLimitError(
         `Lorex daily ingestion budget reached (${this.limits.ingestTokensPerDay} tokens/day). ` +
@@ -140,6 +164,8 @@ export class RateLimiter {
       s.writesToday += amount;
     } else if (kind === "query") {
       s.queriesThisHour += amount;
+    } else if (kind === "synth") {
+      s.synthsThisHour += amount;
     } else {
       s.ingestTokensToday += amount;
     }
@@ -167,6 +193,7 @@ export class RateLimiter {
       s.hourStartedAt = now;
       s.writesThisHour = 0;
       s.queriesThisHour = 0;
+      s.synthsThisHour = 0;
     }
     if (now - s.dayStartedAt >= DAY_MS) {
       s.dayStartedAt = now;
@@ -191,6 +218,7 @@ export class RateLimiter {
         writesToday: Math.min(parsed.writesToday ?? 0, this.limits.writesPerDay),
         queriesThisHour: Math.min(parsed.queriesThisHour ?? 0, this.limits.queriesPerHour),
         ingestTokensToday: Math.min(parsed.ingestTokensToday ?? 0, this.limits.ingestTokensPerDay),
+        synthsThisHour: Math.min(parsed.synthsThisHour ?? 0, this.limits.synthPerHour ?? SYNTH_FALLBACK),
       };
     } catch {
       return freshState(this.now());
@@ -225,7 +253,8 @@ export function loadLimits(): RateLimits {
   return {
     writesPerHour: num(process.env.LOREX_MAX_WRITES_PER_HOUR, DEFAULT_LIMITS.writesPerHour),
     writesPerDay: num(process.env.LOREX_MAX_WRITES_PER_DAY, DEFAULT_LIMITS.writesPerDay),
-    queriesPerHour: num(process.env.LOREX_MAX_QUERIES_PER_HOUR, DEFAULT_LIMITS.queriesPerHour),
-    ingestTokensPerDay: num(process.env.LOREX_MAX_INGEST_TOKENS_PER_DAY, DEFAULT_LIMITS.ingestTokensPerDay),
+      queriesPerHour: num(process.env.LOREX_MAX_QUERIES_PER_HOUR, DEFAULT_LIMITS.queriesPerHour),
+      ingestTokensPerDay: num(process.env.LOREX_MAX_INGEST_TOKENS_PER_DAY, DEFAULT_LIMITS.ingestTokensPerDay),
+      synthPerHour: num(process.env.LOREX_MAX_SYNTH_PER_HOUR, DEFAULT_LIMITS.synthPerHour ?? 30),
   };
 }

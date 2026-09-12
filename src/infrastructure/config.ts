@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { lorexHome } from "./paths.js";
 
 export interface Config {
+  /** Empty = local-first mode (SQLite/JSON store, no network). Set only for cloud sync. */
   apiKey: string;
   baseUrl: string;
   timeoutMs: number;
@@ -102,13 +103,8 @@ export function loadConfig(cwd = process.cwd()): Config {
     process.env[k] ?? dotenv[k] ?? fromStore(k);
 
   const apiKey = (env("HYDRA_DB_API_KEY") ?? env("HYDRADB_API_KEY") ?? "").trim();
-  if (!apiKey) {
-    throw new Error(
-      "Lorex: missing HydraDB API key.\n" +
-        "Set HYDRA_DB_API_KEY in the environment (per docs.hydradb.com), create a .env file, or run `lorex init`.\n" +
-        `Config file: ${configFile()}`,
-    );
-  }
+  // Local-first: no key = local store. Cloud sync is opt-in via `lorex init`
+  // or setting HYDRA_DB_API_KEY. Never throw here.
 
   const baseUrl = (env("HYDRADB_BASE_URL") ?? "https://api.hydradb.com").trim();
   const timeoutMs = Number(env("HYDRADB_TIMEOUT_MS") ?? 15000) || 15000;

@@ -16,7 +16,7 @@ import {
   budgetForHaystack,
   resolveContextBudget,
 } from "../domain/compression.js";
-import { EvalLlm, resolveProvider, type ResolvedProvider } from "./llm.js";
+import { EvalLlm, resolveProvider, resolveProviderChain, type ResolvedProvider } from "./llm.js";
 import {
   judgeQuestion,
   isAbstentionQuestion,
@@ -120,6 +120,7 @@ function parseArgs(argv: string[]) {
     chunkTokens: num("--chunk"),
     stratify: !argv.includes("--no-stratify"),
     minRelevance: flag("--min-relevance") === undefined ? undefined : Number(flag("--min-relevance")),
+    synth: argv.includes("--synth"),
     seed: num("--seed", 42)!,
     resume: !argv.includes("--fresh"),
   };
@@ -320,6 +321,13 @@ async function confirmCost(
     console.log("  Tip: --baseline-window 32000 cuts the baseline arm's cost by ~70%,");
     console.log("       and --no-baseline skips it entirely.\n");
   }
+  const isOpenRouter = cfg.provider === "openai-compatible" && /openrouter\.ai/i.test(cfg.baseUrl ?? "");
+  if (isOpenRouter) {
+    console.log("  OpenRouter notes:");
+    console.log("   • Free models end in ':free' (set LOREX_EVAL_MODEL, e.g. google/gemini-2.5-flash:free)");
+    console.log("   • A full 500-question run makes ~1000+ calls; free tiers are rate-limited.");
+    console.log("   • Checkpoints after every question — re-run without --fresh to resume.\n");
+  }
 
   if (opts.autoConfirm) {
     console.log("  --yes supplied, proceeding.\n");
@@ -371,9 +379,9 @@ async function runBenchmark(opts: Opts): Promise<void> {
     }
   }
 
-  const llm = useLlm ? new EvalLlm(providerCfg!) : null;
+  const llm = useLlm ? new EvalLlm(resolveProviderChain()) : null;
   if (llm) console.log(`
-Judge: ${llm.label}
+Judge: ${llm.label}${resolveProviderChain().length > 1 ? " (failover chain)" : ""}
 `);
   const client = buildClient(opts.mock);
 
@@ -465,11 +473,20 @@ Stratified sample (seed ${opts.seed}): ` +
       maxResults: route.maxResults,
       maxTokens: packBudget,
       minRelevance: opts.minRelevance,
+      synthesize: opts.synth || undefined,
+      verify: opts.synth ? "llm" : undefined,
     });
-    const lorexContext = receipt.sources
-      .map((s) => s.content || s.excerpt || "")
-      .filter(Boolean)
-      .join("\n\n");
+    // --synth: judge the generated grounded answer when we have one; the raw
+    // pack is the fallback. This mirrors the retrieve→answer→judge protocol
+    // other published memory systems use.
+    const lorexAnswer = receipt.answer?.trim();
+    const lorexContext =
+      lorexAnswer && !receipt.abstained
+        ? `${lorexAnswer}\n\n${receipt.sources.map((s) => `[${s.id}] ${s.excerpt}`).join("\n")}`
+        : receipt.sources
+            .map((s) => s.content || s.excerpt || "")
+            .filter(Boolean)
+            .join("\n\n");
     const lorexJudge = await judgeQuestion(llm, spec, lorexContext, receipt.abstained);
     const lorexMs = Date.now() - tLorex;
     record(lorexTally, category, lorexJudge, receipt.token_cost, lorexMs);
@@ -631,6 +648,7 @@ function writeReport(
         : "full dataset",
       seed: opts.seed,
       pack_budget: opts.packTokens ?? "auto (haystack / 46)",
+      answer_generation: opts.synth ? "llm grounded synthesis (receipt.answer)" : "raw context pack",
       chunk_tokens: opts.chunkTokens ?? "default",
       baseline_window: opts.runBaseline ? opts.baselineWindow : null,
       tokenizer: "cl100k_base",

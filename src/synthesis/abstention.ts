@@ -24,6 +24,10 @@ export interface AbstentionOptions {
 
 export const MIN_LEXICAL_RELEVANCE = 0.25;
 
+/** Aggregate/timeline packs (multi-session, chronology) summarize many
+ * sessions, so per-word overlap with the question runs naturally lower. */
+export const MIN_LEXICAL_RELEVANCE_AGGREGATE = 0.12;
+
 const MIN_QUERY_CONTENT_WORDS = 3;
 
 export function determineAbstention(
@@ -97,6 +101,14 @@ export function determineAbstention(
         relevanceScore: relevance,
       };
     }
+    if (hardTermsMissing(extractHardTerms(options.query), scored)) {
+      return {
+        abstained: true,
+        reason: "evidence_not_relevant",
+        confidence: maxScore,
+        relevanceScore: relevance,
+      };
+    }
     return {
       abstained: false,
       confidence: maxScore || relevance,
@@ -118,19 +130,66 @@ function isValidAt(chunk: QueryChunk, asOfTime: number): boolean {
   return vfTime <= asOfTime && asOfTime < (Number.isNaN(vtTime) ? Infinity : vtTime);
 }
 
+/** IDF-weighted coverage of the query's content words across the evidence.
+ * Rare (discriminative) query terms dominate; terms that appear everywhere
+ * contribute almost nothing. Returns per-chunk best coverage in [0,1]. */
 function calculateRelevance(chunks: QueryChunk[], query: string): number {
   const queryWords = tokenize(query);
   if (queryWords.size === 0) return 1;
 
+  const top = chunks.slice(0, 8);
+  const docs = top.map((c) => tokenize((c.text ?? c.content ?? "").toLowerCase()));
+
+  // Document frequency within the candidate set drives the weight: a term
+  // present in one chunk is discriminative; present in all of them is not.
+  const df = new Map<string, number>();
+  for (const w of queryWords) {
+    let n = 0;
+    for (const d of docs) if (d.has(w)) n++;
+    df.set(w, n);
+  }
+  const weight = (w: string): number => {
+    const n = df.get(w) ?? 0;
+    return 1 / (1 + n); // df=0 → 1.0, df=1 → 0.5, df=all → ~0.1
+  };
+  const totalWeight = [...queryWords].reduce((s, w) => s + weight(w), 0);
+  if (totalWeight <= 0) return 1;
+
+  // The anchor is the rarest query term — the one thing the evidence MUST
+  // mention for this to be an answer at all.
+  const anchor = [...queryWords].sort((a, b) => weight(a) - weight(b))[0]!;
+
   let best = 0;
-  for (const chunk of chunks.slice(0, 8)) {
-    const text = (chunk.text ?? chunk.content ?? "").toLowerCase();
-    const textWords = tokenize(text);
-    let overlap = 0;
-    for (const w of queryWords) if (textWords.has(w)) overlap++;
-    best = Math.max(best, overlap / queryWords.size);
+  for (const d of docs) {
+    let covered = 0;
+    for (const w of queryWords) if (d.has(w)) covered += weight(w);
+    if (!d.has(anchor)) covered *= 0.5; // missing anchor halves the score
+    best = Math.max(best, covered / totalWeight);
   }
   return best;
+}
+
+/** Hard identifiers from the query — numbers and acronyms — that must appear
+ * in the evidence, or the "match" is topical but not factual. Capitalized
+ * proper nouns are deliberately excluded: naming aliases ("PostgreSQL" vs
+ * "postgres") are common and would cause false abstentions. */
+function extractHardTerms(query: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of query.matchAll(/\b\d[\d.,:%]*\b/g)) out.add(m[0]);
+  for (const m of query.matchAll(/\b[A-Z]{2,}\b/g)) out.add(m[0]);
+  return out;
+}
+
+function hardTermsMissing(hardTerms: Set<string>, chunks: QueryChunk[]): boolean {
+  if (hardTerms.size === 0 || chunks.length === 0) return false;
+  const haystack = chunks
+    .slice(0, 8)
+    .map((c) => (c.text ?? c.content ?? ""))
+    .join(" ")
+    .toLowerCase();
+  if (!haystack) return false;
+  for (const term of hardTerms) if (!haystack.includes(term.toLowerCase())) return true;
+  return false;
 }
 
 const QUERY_STOPWORDS = new Set([
