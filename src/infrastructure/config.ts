@@ -12,6 +12,7 @@ export interface Config {
   queueCap: number;
   databaseOverride?: string;
   collectionOverride?: string;
+  workspace?: string;
 }
 
 export function configFile(): string {
@@ -25,6 +26,7 @@ interface StoredConfig {
   queueCap?: number;
   database?: string;
   collection?: string;
+  workspace?: string;
 }
 
 function loadDotEnv(cwd: string): Record<string, string> {
@@ -87,6 +89,7 @@ const STORED_KEY_FOR_ENV: Record<string, keyof StoredConfig> = {
   LOREX_QUEUE_CAP: "queueCap",
   LOREX_DATABASE: "database",
   LOREX_COLLECTION: "collection",
+  LOREX_WORKSPACE: "workspace",
 };
 
 export function loadConfig(cwd = process.cwd()): Config {
@@ -117,5 +120,6 @@ export function loadConfig(cwd = process.cwd()): Config {
     queueCap,
     databaseOverride: env("LOREX_DATABASE") || undefined,
     collectionOverride: env("LOREX_COLLECTION") || undefined,
+    workspace: env("LOREX_WORKSPACE") || undefined,
   };
 }
