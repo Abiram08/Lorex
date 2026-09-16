@@ -1,13 +1,23 @@
-/** Tiny HTTP client for a `lorex local` server. Supermemory-style, zero deps.
+/**
+ * Tiny HTTP client for a `lorex local` server.
+ * Zero external deps, Supermemory-style API surface.
  *
- *  ```ts
- *  import { Lorex } from "@lorex/cli/dist/client.js";
- *  const lorex = new Lorex(); // http://127.0.0.1:3777
- *  await lorex.add("Session storage moved to Redis because Atlas timed out");
- *  const r = await lorex.search("what do we use for sessions?");
- *  console.log(r.answer ?? r.summary);
- *  ```
+ * ```ts
+ * import { Lorex } from "@lorex/cli/dist/client.js";
+ * const lorex = new Lorex();
+ * await lorex.add("Session storage moved to Redis because Atlas timed out");
+ * const r = await lorex.search("what do we use for sessions?");
+ * console.log(r.answer ?? r.summary);
+ * ```
  */
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+export interface AddResult {
+  ok: boolean;
+  summary?: string;
+  result?: unknown;
+}
 
 export interface SearchResult {
   answer?: string;
@@ -16,39 +26,56 @@ export interface SearchResult {
   sources?: Array<{ excerpt?: string; content?: string; score?: number }>;
 }
 
+export interface HealthResult {
+  ok: boolean;
+  workspace?: string;
+  agent?: string;
+}
+
+// ── Errors ───────────────────────────────────────────────────────────────────
+
+export class LorexError extends Error {
+  constructor(public readonly status: number, message: string) {
+    super(message);
+    this.name = "LorexError";
+  }
+}
+
+// ── Client ───────────────────────────────────────────────────────────────────
+
 export class Lorex {
   constructor(private readonly baseUrl = "http://127.0.0.1:3777") {}
 
-  private async post<T>(path: string, body: unknown): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method: "POST",
+  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+    const opts: RequestInit = {
+      method,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`lorex ${path}: ${res.status} ${(await res.text()).slice(0, 200)}`);
-    return res.json() as Promise<T>;
+    };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+
+    const res = await fetch(`${this.baseUrl}${path}`, opts);
+    const text = await res.text();
+    if (!res.ok) throw new LorexError(res.status, `lorex ${path}: ${res.status} ${text.slice(0, 200)}`);
+    return JSON.parse(text) as T;
   }
 
-  /** Store a fact. Put the reason in the text ("... because ...") or pass it. */
-  async add(text: string, opts: { id?: string; because?: string } = {}): Promise<{ summary?: string }> {
-    return this.post("/add", { text, ...opts });
+  /** Store a fact. Include the reason in text ("... because ...") or pass it explicitly. */
+  async add(text: string, opts: { id?: string; because?: string } = {}): Promise<AddResult> {
+    return this.request<AddResult>("POST", "/add", { text, ...opts });
   }
 
-  /** Recall. Returns answer + sources; check `abstained` before trusting. */
+  /** Recall. Check `abstained` before trusting the answer. */
   async search(query: string, opts: { asOf?: string } = {}): Promise<SearchResult> {
-    return this.post("/search", { query, ...opts });
+    return this.request<SearchResult>("POST", "/search", { query, ...opts });
   }
 
   /** Session-start pack: latest handoff + contributing agents + summary. */
   async resume(): Promise<SearchResult> {
-    const res = await fetch(`${this.baseUrl}/resume`);
-    if (!res.ok) throw new Error(`lorex /resume: ${res.status}`);
-    return res.json() as Promise<SearchResult>;
+    return this.request<SearchResult>("GET", "/resume");
   }
 
-  async health(): Promise<{ ok: boolean; workspace?: string }> {
-    const res = await fetch(`${this.baseUrl}/health`);
-    if (!res.ok) throw new Error(`lorex /health: ${res.status}`);
-    return res.json() as Promise<{ ok: boolean; workspace?: string }>;
+  /** Health check. */
+  async health(): Promise<HealthResult> {
+    return this.request<HealthResult>("GET", "/health");
   }
 }

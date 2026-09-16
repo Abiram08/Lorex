@@ -9,10 +9,12 @@ import { lorexHome } from "../infrastructure/paths.js";
 import { resolveIdentity } from "../infrastructure/identity.js";
 import { HydraDBClient, type HydraDBLike } from "../infrastructure/hydradb-client.js";
 import { MockHydraDB } from "../infrastructure/mock-hydradb.js";
+import { SqliteStore } from "../infrastructure/sqlite-store.js";
 import { WriteQueue } from "../infrastructure/write-queue.js";
 import { LorexEngine } from "../engine.js";
 import { runStdioServer } from "./mcp-server.js";
 import { startDashboard } from "./dashboard.js";
+import { installHooks, isAgentSupported } from "./agent-hooks.js";
 
 function println(s = ""): void { process.stdout.write(s + "\n"); }
 
@@ -106,7 +108,7 @@ async function cmdWire(args: string[]): Promise<void> {
 async function cmdHooks(args: string[]): Promise<void> {
   const sub = args[0] ?? "install";
   if (sub !== "install") {
-    println('Usage: lorex hooks install [--agent claude-code]');
+    println('Usage: lorex hooks install [--agent claude-code|cursor|windsurf|codex]');
     return;
   }
   const at = (name: string): string | undefined => {
@@ -114,42 +116,16 @@ async function cmdHooks(args: string[]): Promise<void> {
     return i >= 0 ? args[i + 1] : undefined;
   };
   const agent = at("--agent") ?? "claude-code";
-  if (agent !== "claude-code") {
-    println(`Hooks not yet supported for "${agent}" — only --agent claude-code today.`);
+
+  if (!isAgentSupported(agent)) {
+    println(`Unknown agent: "${agent}". Supported: claude-code, cursor, windsurf, codex`);
     process.exitCode = 1;
     return;
   }
-  const settingsPath = join(process.cwd(), ".claude", "settings.json");
-  mkdirSync(join(process.cwd(), ".claude"), { recursive: true });
-  const settings = readJsonFile(settingsPath);
-  const hooks = (settings.hooks ?? {}) as Record<string, Array<Record<string, unknown>>>;
 
-  const want: Record<string, Array<{ matcher?: string }>> = {
-    SessionStart: [{ matcher: "startup" }, { matcher: "compact" }, {}],
-    PreCompact: [{}],
-  };
-  for (const [event, entries] of Object.entries(want)) {
-    const list = hooks[event] ?? [];
-    for (const e of entries) {
-      // Dedup per matcher: same event + same matcher + same command = skip.
-      const exists = list.some((h) =>
-        (h.matcher ?? "") === (e.matcher ?? "") &&
-        JSON.stringify(h).includes("lorex resume --plain"),
-      );
-      if (!exists) {
-        list.push({
-          ...(e.matcher ? { matcher: e.matcher } : {}),
-          hooks: [{ type: "command", command: "lorex resume --plain" }],
-        });
-      }
-    }
-    hooks[event] = list;
-  }
-  settings.hooks = hooks;
-  writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n");
-  println(`Hooks installed: ${settingsPath}`);
-  println("  SessionStart → memory summary loads into every session automatically.");
-  println("  PreCompact   → memory re-injected after compaction.");
+  const { path, description } = installHooks(agent, process.cwd());
+  println(`Hooks installed: ${path}`);
+  for (const line of description.split("\n")) println(`  ${line}`);
 }
 
 async function cmdInit(argv: string[] = []): Promise<void> {
@@ -290,21 +266,22 @@ function identityFrom(args: string[], config: Config) {
 }
 
 function resolveLocalStorePath(): string {
-  const next = join(lorexHome(), "local-store.json");
-  if (existsSync(next)) return next;
-  const legacy = join(lorexHome(), "mock-store.json");
-  if (existsSync(legacy)) return legacy;
+  const next = join(lorexHome(), "local-store.db");
   return next;
 }
 
 function buildClient(useMock: boolean, config: Config): HydraDBLike {
-  // Local-first: default to the local store. Cloud (HydraDB) is opt-in only
-  // when a key is configured AND --cloud is passed. --mock is kept as an alias.
+  // Local-first: SQLite is the default. Cloud (HydraDB) is opt-in only
+  // when a key is configured AND --cloud is passed. --mock falls back to JSON.
   const wantsCloud = !useMock && (config.apiKey?.trim() ?? "") !== "" && process.argv.includes("--cloud");
-  if (!wantsCloud) {
-    return new MockHydraDB({ persistPath: resolveLocalStorePath() });
+  const wantsMock = useMock && !process.argv.includes("--sqlite");
+  if (wantsCloud) {
+    return new HydraDBClient(config);
   }
-  return new HydraDBClient(config);
+  if (wantsMock) {
+    return new MockHydraDB({ persistPath: join(lorexHome(), "mock-store.json") });
+  }
+  return new SqliteStore({ path: resolveLocalStorePath() });
 }
 
 async function cmdStart(args: string[]): Promise<void> {
@@ -644,29 +621,50 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
       break;
     }
     case "capture": {
-      const sessionId = flag("--sessionId");
-      const file = flag("--file");
-      if (!sessionId) return println(JSON.stringify({ error: "--sessionId required" }));
-      if (!file) return println(JSON.stringify({ error: "--file required (JSON file with turns)" }));
+      const { captureTranscript, autoCaptureClaudeSession } = await import("../ingestion/session-capture.js");
+      const transcriptPath = flag("--transcript") ?? flag("--file");
 
-      const { normalizeSession } = await import("../ingestion/normalizer.js");
-      const { readFileSync } = await import("node:fs");
-      const turns = JSON.parse(readFileSync(file, "utf8"));
-      const session = normalizeSession(sessionId, identity.database, identity.collection, turns, {
-        startedAt: flag("--startedAt"),
-        agent: "cli",
-        source: "capture",
-      });
-      const result = await engine.ingestSession(session);
-      receipt = {
-        op: "ingest",
-        sources: [],
-        mode_used: "fast",
-        token_cost: result.tokenCount,
-        abstained: false,
-        summary: `Ingested session ${result.sessionId}: ${result.chunkCount} chunks, ${result.factCount} facts${result.partial ? " (partial)" : ""}`,
-        result,
-      };
+      if (transcriptPath) {
+        // Explicit transcript path
+        receipt = await captureTranscript(engine, {
+          transcriptPath,
+          sessionId: flag("--sessionId"),
+          agent: flag("--agent"),
+          startedAt: flag("--startedAt"),
+        });
+        receipt = {
+          op: "capture",
+          sources: [],
+          mode_used: "fast",
+          token_cost: receipt.tokenCount,
+          abstained: false,
+          summary: `Captured session ${receipt.sessionId}: ${receipt.chunkCount} chunks, ${receipt.factCount} facts${receipt.partial ? " (partial)" : ""}`,
+          result: receipt,
+        };
+      } else {
+        // Auto-detect most recent Claude session
+        const result = await autoCaptureClaudeSession(engine);
+        if (!result) {
+          receipt = {
+            op: "capture",
+            sources: [],
+            mode_used: "fast",
+            token_cost: 0,
+            abstained: true,
+            summary: "No recent Claude Code session found.",
+          };
+        } else {
+          receipt = {
+            op: "capture",
+            sources: [],
+            mode_used: "fast",
+            token_cost: result.tokenCount,
+            abstained: false,
+            summary: `Captured session ${result.sessionId}: ${result.chunkCount} chunks, ${result.factCount} facts`,
+            result,
+          };
+        }
+      }
       break;
     }
     default:
