@@ -47,6 +47,9 @@ import { HydraDBError } from "./infrastructure/hydradb-client.js";
 import { RateLimiter, RateLimitError } from "./infrastructure/rate-limiter.js";
 import { computeCompression, resolveContextBudget } from "./domain/compression.js";
 import { countTokens } from "./ingestion/token-counter.js";
+import { dreamHeuristic, type DreamOptions, type DreamResult } from "./infrastructure/dream.js";
+import { planConsolidation } from "./infrastructure/lifecycle.js";
+import type { SqliteStore } from "./infrastructure/sqlite-store.js";
 
 const CORPUS_STATS_KEY = "lorex_corpus_stats";
 const CORPUS_STATS_TYPE = "corpus_stats";
@@ -60,6 +63,8 @@ export interface RememberOpts {
   ttlSeconds?: number;
   because?: string;
   agent?: string;
+  /** "global" writes to the shared user-level collection visible everywhere. */
+  scope?: "global" | "project";
 }
 
 export interface RecallOpts {
@@ -304,6 +309,7 @@ export class LorexEngine {
         ? "extracted"
         : "unknown";
     const transition = extractTransition(body);
+    const targetCollection = opts.scope === "global" ? "global" : this.identity.collection;
 
     const status = opts.forget ? "forgotten" : opts.validTo ? "superseded" : "current";
     const item: MemoryItem = {
@@ -338,12 +344,12 @@ export class LorexEngine {
     try {
       const res = await this.client.ingestMemory({
         database: this.identity.database,
-        collection: this.identity.collection,
+        collection: targetCollection,
         memories: [item],
       });
       await this.client.awaitIndexed(res.ids, LIMITS.indexMaxAttempts, LIMITS.indexIntervalMs, {
         database: this.identity.database,
-        collection: this.identity.collection,
+        collection: targetCollection,
       });
       this.trackTokens(atomic);
       this.rememberVersion(factKey, versionId, validFrom, atomic, item.additional_metadata!);
@@ -713,6 +719,7 @@ export class LorexEngine {
       mode: "fast",
       type: "memory",
       maxResults: clampInt(opts.maxResults, 100, 1, LIMITS.maxResults),
+      includeSuperseded: true,
     });
 
     const matchVersion = (c: QueryChunk): boolean => {
@@ -733,6 +740,7 @@ export class LorexEngine {
         mode: "fast",
         type: "all",
         maxResults: 100,
+        includeSuperseded: true,
       });
       matched = retry.chunks.filter(matchVersion);
     }
@@ -1054,12 +1062,81 @@ export class LorexEngine {
     return r;
   }
 
+  private get lifecycleStore(): SqliteStore | null {
+    const c = this.client as Partial<SqliteStore>;
+    return typeof c.getConsolidationCandidates === "function" ? (c as SqliteStore) : null;
+  }
+
+  /** Run heuristic Dream and persist discoveries as memories. */
+  async dream(opts: DreamOptions = {}): Promise<DreamResult & { persisted: number }> {
+    await this.ensureReady();
+    const result = await dreamHeuristic(this.client, this.identity.collection, opts);
+    let persisted = 0;
+
+    if (result.discovered.length) {
+      this.limiter.acquire("write");
+      const now = new Date().toISOString();
+      await this.client.ingestMemory({
+        database: this.identity.database,
+        collection: this.identity.collection,
+        memories: result.discovered.map((d) => ({
+          id: `dream_${d.factKey}_${Date.now().toString(36)}`,
+          text: d.text,
+          additional_metadata: {
+            schema_version: METADATA_SCHEMA_VERSION,
+            fact_key: d.factKey,
+            memory_type: d.memoryType,
+            valid_from: now,
+            status: "current",
+            agent: this.agent,
+            confidence: d.confidence,
+            source: `dream:${d.source}`,
+          },
+        })),
+      });
+      persisted = result.discovered.length;
+    }
+
+    for (const id of result.reinforced) {
+      this.lifecycleStore?.recordAccess(id);
+    }
+
+    return { ...result, persisted };
+  }
+
+  /** Plan consolidation; auto-applies expired TTL entries, reports the rest. */
+  async consolidate(applyPruned = false): Promise<{ planned: number; pruned: number; expired: number; merged: number }> {
+    await this.ensureReady();
+    const store = this.lifecycleStore;
+    if (!store) return { planned: 0, pruned: 0, expired: 0, merged: 0 };
+
+    const candidates = store.getConsolidationCandidates(this.identity.collection);
+    const plan = planConsolidation(candidates);
+    const resolved = store.resolveContradictions(this.identity.collection);
+    const applied = store.applyConsolidation({
+      pruned: applyPruned ? plan.pruned : [],
+      merged: applyPruned ? plan.merged : [],
+      reinforced: [],
+      expired: plan.expired,
+    });
+
+    return { planned: plan.pruned.length + plan.expired.length + plan.merged.length + resolved, pruned: applied.pruned, expired: applied.expired, merged: applyPruned ? plan.merged.length : 0 };
+  }
+
+  /** Unfinished work: tasks recorded but never acted on. */
+  async openLoops(): Promise<Array<{ id: string; text: string; created_at: string; age_days: number }>> {
+    await this.ensureReady();
+    const store = this.lifecycleStore;
+    return store ? store.getOpenLoops(this.identity.collection) : [];
+  }
+
   async report(input: {
     requestId: string;
     answer?: string;
     sourceIds?: string[];
     rating?: "positive" | "negative" | "neutral";
     feedback?: string;
+    query?: string;
   }): Promise<Receipt> {
     if (!input.requestId?.trim()) throw new Error("requestId is required");
     this.limiter.acquire("write");
@@ -1071,7 +1148,7 @@ export class LorexEngine {
       database: this.identity.database,
       collection: this.identity.collection,
       ground_truth: input.answer ? { answer: input.answer, source_ids: input.sourceIds } : undefined,
-      metadata: { agent: "lorex" },
+      metadata: { agent: "lorex", ...(input.query ? { query: input.query } : {}) },
     };
     try {
       await this.client.feedback(feedback);

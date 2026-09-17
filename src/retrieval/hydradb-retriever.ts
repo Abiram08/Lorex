@@ -12,6 +12,7 @@ export interface RetrieveOptions {
   maxResults?: number;
   asOf?: string;
   recencyBias?: number;
+  includeSuperseded?: boolean;
 }
 
 export interface RetrieveResult {
@@ -43,6 +44,9 @@ export async function retrieve(
   if (options.asOf) {
     input.metadata_filters = { as_of: options.asOf };
     input.recency_bias = 0;
+  }
+  if (options.includeSuperseded) {
+    input.metadata_filters = { ...(input.metadata_filters ?? {}), include_superseded: true };
   }
 
   try {

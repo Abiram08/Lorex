@@ -1,25 +1,10 @@
-/**
- * Dream: background extraction of patterns from session history.
- *
- * Inspired by pi-memory's 3-stage Dream pipeline (Miner → Refiner → Advisor).
- * Runs periodically or on demand to evolve the memory graph.
- *
- * Two modes:
- * - Heuristic Dream (default): Pattern detection by frequency, preference
- *   reinforcement, contradiction detection — no LLM needed.
- * - LLM Dream (opt-in): Deeper pattern extraction via LLM — requires API key.
- *
- * Dream does NOT block the main session. It runs in the background or
- * is triggered explicitly via `lorex dream`.
- */
+/** Dream: background pattern extraction from session history. Heuristic, no LLM needed. */
 
 import type { HydraDBLike, QueryChunk } from "./hydradb-client.js";
 import {
   planConsolidation,
   type ConsolidationCandidate,
 } from "./lifecycle.js";
-
-// ── Types ────────────────────────────────────────────────────────────────────
 
 export interface DreamResult {
   discovered: DreamMemory[];
@@ -49,7 +34,9 @@ export interface DreamOptions {
   consolidate?: boolean;
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+interface QueryFailureAware {
+  getQueryFailures(limit?: number): Array<{ pattern: string; fails: number }>;
+}
 
 function groupByFactKey(chunks: QueryChunk[]): Map<string, QueryChunk[]> {
   const map = new Map<string, QueryChunk[]>();
@@ -66,8 +53,6 @@ function metadataDate(chunk: QueryChunk, field: string): string | null {
   const val = chunk.metadata?.[field];
   return typeof val === "string" && val ? val : null;
 }
-
-// ── Heuristic Dream ──────────────────────────────────────────────────────────
 
 export async function dreamHeuristic(
   client: HydraDBLike,
@@ -102,14 +87,10 @@ export async function dreamHeuristic(
 
   const byFactKey = groupByFactKey(chunks);
 
-  // ── Mine: repeated preferences ────────────────────────────────────────
-
   for (const [key, group] of byFactKey) {
     if (group.length < 3) continue;
-
     const confidence = Math.min(1.0, 0.6 + (group.length - 3) * 0.05);
     if (confidence < minConfidence) continue;
-
     result.discovered.push({
       text: `Repeated pattern (${group.length}x): ${group[0].text}`,
       factKey: `dream_pref_${key}`,
@@ -119,16 +100,12 @@ export async function dreamHeuristic(
     });
   }
 
-  // ── Mine: temporal patterns ───────────────────────────────────────────
-
   for (const [key, group] of byFactKey) {
     if (group.length < 2) continue;
-
     const dates = group
       .map((c) => metadataDate(c, "valid_from") ?? metadataDate(c, "created_at"))
       .filter((d): d is string => !!d)
       .sort();
-
     if (dates.length < 2) continue;
 
     const spanMs = Date.parse(dates[dates.length - 1]) - Date.parse(dates[0]);
@@ -144,12 +121,9 @@ export async function dreamHeuristic(
     }
   }
 
-  // ── Mine: correction chains ───────────────────────────────────────────
-
   for (const [key, group] of byFactKey) {
     const corrections = group.filter((c) => c.metadata?.memory_type === "correction");
     if (corrections.length < 2) continue;
-
     result.contradictions.push({
       factKey: key,
       versionA: {
@@ -165,10 +139,7 @@ export async function dreamHeuristic(
     });
   }
 
-  // Cap discoveries
   result.discovered = result.discovered.slice(0, maxDiscoveries);
-
-  // ── Refine: deduplicate ───────────────────────────────────────────────
 
   const unique = new Map<string, DreamMemory>();
   for (const d of result.discovered) {
@@ -179,8 +150,6 @@ export async function dreamHeuristic(
   }
   result.discovered = Array.from(unique.values());
 
-  // ── Reinforce: find heavily accessed memories ─────────────────────────
-
   for (const chunk of chunks) {
     const accessCount = (chunk.metadata?.access_count as number) ?? 0;
     if (accessCount >= 3) {
@@ -188,7 +157,19 @@ export async function dreamHeuristic(
     }
   }
 
-  // ── Consolidate: plan pruning/expiry ──────────────────────────────────
+  const maybeFailures = client as Partial<QueryFailureAware>;
+  if (typeof maybeFailures.getQueryFailures === "function") {
+    for (const f of maybeFailures.getQueryFailures(5)) {
+      if (f.fails < 3) continue;
+      result.discovered.push({
+        text: `Recall gap: "${f.pattern}" failed ${f.fails}x — memory may be missing or misleading here`,
+        factKey: `dream_gap_${f.pattern.slice(0, 40).replace(/\W+/g, "_")}`,
+        memoryType: "lesson",
+        confidence: Math.min(0.9, 0.5 + f.fails * 0.05),
+        source: "contradiction",
+      });
+    }
+  }
 
   if (opts.consolidate !== false) {
     const candidates: ConsolidationCandidate[] = chunks.map((c) => ({
@@ -210,8 +191,7 @@ export async function dreamHeuristic(
   return result;
 }
 
-// ── Dream Scheduler ──────────────────────────────────────────────────────────
-
+/** Gates: ≥5 unprocessed sessions, ≥24h since last run, not already running. */
 export function shouldDream(
   lastDreamAt: string | null,
   unprocessedSessions: number,

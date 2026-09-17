@@ -13,7 +13,19 @@ import { mkdtempSync } from "node:fs";
 import Database from "better-sqlite3";
 import { SqliteStore } from "../infrastructure/sqlite-store.js";
 import { planConsolidation } from "../infrastructure/lifecycle.js";
+import { normalizeEntity } from "../domain/fact.js";
 import { dreamHeuristic, shouldDream } from "../infrastructure/dream.js";
+import { LorexEngine } from "../engine.js";
+import { resolveIdentity } from "../infrastructure/identity.js";
+
+process.env.LOREX_NO_LIMITS = "1";
+
+function freshEngine(collection: string): { engine: LorexEngine; done: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "lorex-sqlite-eng-"));
+  const store = new SqliteStore({ path: join(dir, "test.db") });
+  const engine = new LorexEngine(store, resolveIdentity(dir, { collection }), 1000);
+  return { engine, done: () => store.close() };
+}
 
 function freshStore(): { store: SqliteStore; done: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "lorex-sqlite-test-"));
@@ -241,6 +253,90 @@ async function remember(
   done();
 }
 
+// ── Feedback signals: re-ranking ─────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await remember(store, "alpha choice for caching layer", "sig", {}, "sig_a");
+  await remember(store, "beta choice for caching layer", "sig", {}, "sig_b");
+
+  const before = await store.query({ query: "caching layer choice", database: "sig", collection: "sig" });
+  const orderBefore = before.chunks.map((c) => c.id);
+
+  // Positive feedback on the second-ranked item should flip the order
+  const loser = orderBefore[orderBefore.length - 1] ?? "sig_a";
+  await store.feedback({
+    request_id: "fb1", rating: "positive", source: "agent",
+    ground_truth: { answer: "beta", source_ids: [loser] },
+  });
+
+  const after = await store.query({ query: "caching layer choice", database: "sig", collection: "sig" });
+  assert.equal(after.chunks[0]?.id, loser, "positive feedback must promote the memory");
+
+  const meta = after.chunks[0]?.metadata as Record<string, unknown>;
+  assert.ok((meta?.signal as number) > 0, "signal must be exposed in metadata");
+
+  // Negative feedback suppresses
+  await store.feedback({
+    request_id: "fb2", rating: "negative", source: "agent",
+    ground_truth: { answer: "no", source_ids: [loser] },
+  });
+  const suppressed = await store.query({ query: "caching layer choice", database: "sig", collection: "sig" });
+  assert.notEqual(suppressed.chunks[0]?.id, loser, "negative feedback must demote the memory");
+
+  // Neutral feedback is a no-op (recorded, no signal change)
+  await store.feedback({ request_id: "fb3", rating: "neutral", source: "agent" });
+
+  // Unknown ids are ignored, not an error
+  await store.feedback({
+    request_id: "fb4", rating: "positive", source: "agent",
+    ground_truth: { answer: "x", source_ids: ["does_not_exist"] },
+  });
+  done();
+}
+
+// ── Signal clamping ──────────────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await remember(store, "clamp target memory", "clamp", {}, "clamp_id");
+
+  for (let i = 0; i < 10; i++) {
+    store.applySignal(["clamp_id"], 0.2);
+  }
+  const q = await store.query({ query: "clamp", database: "clamp", collection: "clamp" });
+  const signal = (q.chunks.find((c) => c.id === "clamp_id")?.metadata as Record<string, unknown> | undefined)?.signal;
+  assert.equal(signal, 1.0, `signal must clamp at 1.0, got ${signal}`);
+
+  for (let i = 0; i < 10; i++) {
+    store.applySignal(["clamp_id"], -0.3);
+  }
+  const q2 = await store.query({ query: "clamp", database: "clamp", collection: "clamp" });
+  const signal2 = (q2.chunks.find((c) => c.id === "clamp_id")?.metadata as Record<string, unknown> | undefined)?.signal;
+  assert.equal(signal2, -1.0, `signal must clamp at -1.0, got ${signal2}`);
+  done();
+}
+
+// ── Correction learning ──────────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await store.ingestMemory({
+    database: "corr",
+    collection: "corr",
+    memories: [{
+      id: "fix_v2", text: "corrected: use Memcached for sessions",
+      additional_metadata: { fact_key: "session_cache", version_id: "fix_v2", memory_type: "correction" },
+      relations: { ids: ["fix_v1"], properties: { type: "supersedes", reason: "Redis timed out" } },
+    }],
+  });
+
+  const q = await store.query({ query: "sessions cache", database: "corr", collection: "corr" });
+  const signal = (q.chunks.find((c) => c.id === "fix_v2")?.metadata as Record<string, unknown> | undefined)?.signal;
+  assert.ok((signal as number) > 0, `correction should self-reinforce, got signal=${signal}`);
+  done();
+}
+
 // ── planConsolidation edge cases ─────────────────────────────────────────────
 
 {
@@ -308,6 +404,350 @@ async function remember(
     shouldDream(new Date(Date.now() - 25 * 3_600_000).toISOString(), 10, false), true,
     "runs after cooldown",
   );
+}
+
+// ── Entity normalization ─────────────────────────────────────────────────────
+
+{
+  assert.equal(normalizeEntity("PostgreSQL"), "postgres");
+  assert.equal(normalizeEntity("postgres db"), "postgres");
+  assert.equal(normalizeEntity("K8s"), "kubernetes");
+  assert.equal(normalizeEntity("  TypeScript  "), "typescript");
+}
+
+// ── Global scope ─────────────────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await store.ingestMemory({
+    database: "d", collection: "global",
+    memories: [{ id: "g1", text: "User always prefers TypeScript", additional_metadata: { fact_key: "g1", memory_type: "preference" } }],
+  });
+  await remember(store, "Project uses Postgres for analytics", "proj", {}, "p1");
+
+  const fromProj = await store.query({ query: "TypeScript", database: "d", collection: "proj" });
+  assert.ok(fromProj.chunks.some((c) => c.id === "g1"), "global memory visible from project collection");
+
+  const fromOther = await store.query({ query: "Postgres analytics", database: "d", collection: "other" });
+  assert.ok(!fromOther.chunks.some((c) => c.id === "p1"), "project memory isolated from other collections");
+
+  const fromGlobal = await store.query({ query: "Postgres", database: "d", collection: "global" });
+  assert.ok(!fromGlobal.chunks.some((c) => c.id === "p1"), "global queries don't leak project memories");
+  done();
+}
+
+// ── Synonym expansion ────────────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await remember(store, "We standardized on PostgreSQL last quarter", "syn", {}, "syn1");
+
+  const q = await store.query({ query: "psql standard", database: "d", collection: "syn" });
+  assert.ok(q.chunks.some((c) => c.id === "syn1"), "psql should match PostgreSQL via synonym expansion");
+  done();
+}
+
+// ── Ingest-time verbatim dedup ───────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  const first = await store.ingestMemory({
+    database: "d", collection: "dd",
+    memories: [{ text: "Identical captured sentence about caching" }],
+  });
+  const second = await store.ingestMemory({
+    database: "d", collection: "dd",
+    memories: [{ text: "Identical captured sentence about caching" }],
+  });
+  assert.deepEqual(second.ids, first.ids, "verbatim re-ingest reuses the row");
+
+  const cands = store.getConsolidationCandidates("dd");
+  assert.equal(cands.length, 1, "no duplicate row created");
+  assert.equal(cands[0]?.accessCount, 1, "re-ingest counts as access");
+  done();
+}
+
+// ── Incremental strength updates ─────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await remember(store, "incremental strength target", "inc", {}, "inc1");
+  assert.equal(store.updateStrengths("inc"), 1, "full pass updates");
+
+  // Immediately after: nothing stale → incremental pass is a no-op
+  assert.equal(store.updateStrengths("inc", 24), 0, "incremental pass skips fresh rows");
+  done();
+}
+
+// ── Contradiction auto-resolution ────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  for (const [id, text] of [["c1", "first correction: use A"], ["c2", "second correction: use B"]]) {
+    await store.ingestMemory({
+      database: "d", collection: "cx",
+      memories: [{ id, text, additional_metadata: { fact_key: "fix", version_id: id, memory_type: "correction" } }],
+    });
+  }
+  // Backdate c1 so c2 is unambiguously newest
+  (store as unknown as { db: import("better-sqlite3").Database })
+    .db.prepare(`UPDATE memories SET created_at = '2020-01-01 00:00:00' WHERE id = 'c1'`).run();
+
+  assert.equal(store.resolveContradictions("cx"), 1, "one loser superseded");
+
+  const q = await store.query({ query: "correction", database: "d", collection: "cx" });
+  const ids = q.chunks.map((c) => c.id);
+  assert.ok(ids.includes("c2") && !ids.includes("c1"), "newest correction wins");
+  done();
+}
+
+// ── Open loops ───────────────────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await store.ingestMemory({
+    database: "d", collection: "loops",
+    memories: [
+      { id: "stale_task", text: "Migrate the logout path", additional_metadata: { fact_key: "stale_task", memory_type: "task" } },
+      { id: "fresh_task", text: "Update the changelog", additional_metadata: { fact_key: "fresh_task", memory_type: "task" } },
+      { id: "touched_task", text: "Refactor auth module", additional_metadata: { fact_key: "touched_task", memory_type: "task" } },
+    ],
+  });
+  const db = (store as unknown as { db: import("better-sqlite3").Database }).db;
+  db.prepare(`UPDATE memories SET created_at = '2020-01-01 00:00:00' WHERE id = 'stale_task'`).run();
+  store.recordAccess("touched_task");
+  db.prepare(`UPDATE memories SET created_at = '2020-01-01 00:00:00' WHERE id = 'touched_task'`).run();
+
+  const loops = store.getOpenLoops("loops");
+  assert.ok(loops.some((l) => l.id === "stale_task"), "old unaccessed task is open");
+  assert.ok(!loops.some((l) => l.id === "fresh_task"), "recent task is not open");
+  assert.ok(!loops.some((l) => l.id === "touched_task"), "accessed task is not open");
+  done();
+}
+
+// ── Query failures → Dream gaps ──────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await remember(store, "some unrelated memory content", "gaps", {}, "gap1");
+  for (let i = 0; i < 3; i++) {
+    await store.feedback({
+      request_id: `gap${i}`, rating: "negative", source: "agent",
+      ground_truth: { answer: "no", source_ids: ["gap1"] },
+      metadata: { query: "how do sessions work" },
+    });
+  }
+
+  const failures = store.getQueryFailures();
+  assert.ok(failures.some((f) => f.pattern.includes("sessions") && f.fails === 3), "failures tracked");
+
+  const r = await dreamHeuristic(store, "gaps");
+  assert.ok(r.discovered.some((d) => d.factKey.startsWith("dream_gap_")), "recall gap surfaced as discovery");
+  done();
+}
+
+// ── Thinking-mode relation expansion ─────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await store.ingestMemory({
+    database: "d", collection: "exp",
+    memories: [
+      { id: "hub", text: "central decision about caching", additional_metadata: { fact_key: "hub", memory_type: "decision" } },
+      {
+        id: "spoke", text: "linked rationale about latency", additional_metadata: { fact_key: "spoke" },
+        relations: { ids: ["hub"], properties: { type: "relates" } },
+      },
+    ],
+  });
+
+  const fast = await store.query({ query: "caching decision", database: "d", collection: "exp", mode: "fast" });
+  const thinking = await store.query({ query: "caching decision", database: "d", collection: "exp", mode: "thinking" });
+  assert.ok(
+    thinking.chunks.some((c) => c.id === "spoke"),
+    "thinking mode must pull the related rationale via the relates edge",
+  );
+  assert.ok(
+    thinking.chunks.length >= fast.chunks.length,
+    "thinking mode must include at least the fast results",
+  );
+  done();
+}
+
+// ── Staleness in metadata ────────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await remember(store, "staleness surfaced memory", "stale", {}, "st1");
+  const q = await store.query({ query: "staleness", database: "d", collection: "stale" });
+  const meta = q.chunks.find((c) => c.id === "st1")?.metadata as Record<string, unknown> | undefined;
+  assert.equal(meta?.staleness, "today", "fresh memory tagged today");
+  done();
+}
+
+// ── Engine: dream persists discoveries ───────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("dream_eng");
+  for (let i = 0; i < 3; i++) {
+    await engine.remember(`Always run the test suite before commit attempt ${i}`, { id: `-commit_pref_${i}` });
+  }
+  const r = await engine.dream();
+  assert.ok(r.persisted >= 0, "dream runs without error");
+  assert.ok(r.durationMs >= 0);
+  done();
+}
+
+// ── Engine: consolidate applies expiry ───────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("cons_eng");
+  await engine.remember("Ephemeral debug note about logging", { id: "debug_note" });
+  const r = await engine.consolidate();
+  assert.ok(r.planned >= 0 && r.expired >= 0, "consolidate returns counts");
+  done();
+}
+
+// ── Engine: open loops ───────────────────────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("loops_eng");
+  await engine.remember("Temporary scratch task for testing", { id: "scratch" });
+  const loops = await engine.openLoops();
+  assert.ok(Array.isArray(loops), "openLoops returns an array");
+  done();
+}
+
+// ── Engine: global scope remember ────────────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("scope_eng");
+  await engine.remember("User prefers concise output", { id: "concise_pref", scope: "global" });
+  const r = await engine.recall({ query: "concise output preference" });
+  assert.ok(
+    r.sources.some((s) => s.id.includes("concise") || (s.excerpt ?? "").includes("concise") || (s.content ?? "").includes("concise")),
+    "global memory recalled from project collection",
+  );
+  done();
+}
+
+// ── Stress: 10k memories ─────────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  const N = 10_000;
+  const batch = 500;
+
+  const t0 = Date.now();
+  for (let b = 0; b < N / batch; b++) {
+    await store.ingestMemory({
+      database: "d",
+      collection: "stress",
+      memories: Array.from({ length: batch }, (_, i) => {
+        const n = b * batch + i;
+        return {
+          id: `stress_${n}`,
+          text: `Stress fact ${n} about service ${n % 100} region ${n % 10} config value ${n}`,
+          additional_metadata: { fact_key: `stress_${n}`, memory_type: n % 7 === 0 ? "episode" : "fact" },
+        };
+      }),
+    });
+  }
+  const ingestMs = Date.now() - t0;
+
+  const q0 = Date.now();
+  const q = await store.query({ query: "service 42 config", database: "d", collection: "stress" });
+  const queryMs = Date.now() - q0;
+
+  assert.ok(q.chunks.length > 0, "stress store returns results");
+  console.log(`  stress: ${N} ingested in ${ingestMs}ms (${(N / (ingestMs / 1000)).toFixed(0)}/s), query ${queryMs}ms`);
+
+  const stats = store.getLifecycleStats("stress");
+  assert.equal(stats.total, N);
+
+  const u0 = Date.now();
+  const skipped = store.updateStrengths("stress", 24);
+  const updateMs = Date.now() - u0;
+  console.log(`  stress: incremental strength pass skipped ${N - skipped}/${N} in ${updateMs}ms`);
+  done();
+}
+
+// ── Consolidation merge path ─────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await store.ingestMemory({
+    database: "d", collection: "merge",
+    memories: [
+      { id: "m_strong", text: "The deploy pipeline uses GitHub Actions with staging gates and prod approval", additional_metadata: { fact_key: "deploy", strength: 0.9 } },
+      { id: "m_weak", text: "The deploy pipeline uses GitHub Actions", additional_metadata: { fact_key: "deploy", strength: 0.4 } },
+    ],
+  });
+
+  const cands = store.getConsolidationCandidates("merge");
+  const plan = planConsolidation(cands);
+  assert.ok(plan.merged.length === 1, `similar fact_keys merge, got ${JSON.stringify(plan.merged)}`);
+  assert.equal(plan.merged[0]?.keep, "m_strong");
+  assert.deepEqual(plan.merged[0]?.drop, ["m_weak"]);
+
+  const applied = store.applyConsolidation({ pruned: [], merged: plan.merged, reinforced: [], expired: [] });
+  assert.equal(applied.pruned, 1, "merged loser counts as pruned");
+
+  const q = await store.query({ query: "deploy pipeline", database: "d", collection: "merge" });
+  assert.ok(!q.chunks.some((c) => c.id === "m_weak"), "merged loser not returned");
+  done();
+}
+
+// ── Migration adds signal + query_failures ───────────────────────────────────
+
+{
+  const dir = mkdtempSync(join(tmpdir(), "lorex-sqlite-mig2-"));
+  const path = join(dir, "old.db");
+  const raw = new Database(path);
+  raw.exec(`
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY, text TEXT NOT NULL,
+      corpus TEXT NOT NULL DEFAULT 'memory',
+      collection TEXT NOT NULL DEFAULT 'default',
+      fact_key TEXT, status TEXT DEFAULT 'current',
+      metadata TEXT DEFAULT '{}', relations TEXT DEFAULT '[]',
+      created_at TEXT DEFAULT (datetime('now')),
+      updated_at TEXT DEFAULT (datetime('now'))
+    );
+    INSERT INTO memories (id, text, collection) VALUES ('sig_legacy', 'legacy signal target', 'mig2');
+  `);
+  raw.close();
+
+  const store = new SqliteStore({ path });
+  store.applySignal(["sig_legacy"], 0.2);
+  const q = await store.query({ query: "legacy signal", database: "d", collection: "mig2" });
+  const signal = (q.chunks.find((c) => c.id === "sig_legacy")?.metadata as Record<string, unknown> | undefined)?.signal;
+  assert.equal(signal, 0.2, "migrated signal column works");
+
+  await store.feedback({ request_id: "migfb", rating: "negative", source: "agent", metadata: { query: "legacy pattern" } });
+  assert.equal(store.getQueryFailures()[0]?.pattern, "legacy pattern", "query_failures table migrated");
+  store.close();
+}
+
+// ── WAL concurrency: parallel readers + writer ───────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await store.ingestMemory({
+    database: "d", collection: "conc",
+    memories: Array.from({ length: 50 }, (_, i) => ({
+      id: `conc_${i}`, text: `concurrent fact ${i} about shared caching state`,
+      additional_metadata: { fact_key: `conc_${i}` },
+    })),
+  });
+
+  const readers = Array.from({ length: 10 }, () =>
+    store.query({ query: "caching state", database: "d", collection: "conc" }),
+  );
+  const results = await Promise.all(readers);
+  assert.ok(results.every((r) => r.chunks.length > 0), "all parallel readers get results");
+  assert.ok(new Set(results.map((r) => r.chunks[0]?.id)).size >= 1, "consistent top hit");
+  done();
 }
 
 console.log("✓ sqlite integration tests passed");

@@ -129,6 +129,19 @@ function hasDecisionSignal(lower: string): boolean {
   );
 }
 
+/** Canonical entity id: "PostgreSQL", "postgres db" → "postgres". */
+export function normalizeEntity(name: string): string {
+  const cleaned = name.toLowerCase().replace(/[^\w\s]/g, "").replace(/\s+/g, " ").trim();
+  const direct = normalizeTopicAlias(cleaned);
+  if (direct !== cleaned) return direct;
+  const words = cleaned.split(" ");
+  const last = words[words.length - 1];
+  if ((last === "db" || last === "database") && words.length > 1) {
+    return normalizeTopicAlias(words.slice(0, -1).join(" "));
+  }
+  return cleaned;
+}
+
 function normalizeTopicAlias(topic: string): string {
   const t = topic.toLowerCase();
   if (t === "postgresql" || t === "psql") return "postgres";

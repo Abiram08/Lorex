@@ -1,5 +1,7 @@
 /** Context graph construction from receipt sources and HydraDB relations. */
 
+import { normalizeEntity } from "./fact.js";
+
 export type NodeKind =
   | "fact"
   | "superseded"
@@ -203,7 +205,7 @@ export function buildContextGraph(
     const ents = Array.isArray(p.entities) ? p.entities : [];
     for (const e of ents) {
       if (typeof e !== "string" || e.length < 2) continue;
-      const entId = `entity:${e.toLowerCase()}`;
+      const entId = `entity:${normalizeEntity(e)}`;
       addNode({ id: entId, kind: "entity", label: e });
       if (chunkId && nodes.has(chunkId)) {
         edges.push({ source: entId, target: chunkId, kind: "relates" });
@@ -214,7 +216,7 @@ export function buildContextGraph(
   for (const entity of opts.relations?.entities ?? []) {
     const name = entity.name ?? entity.id;
     if (!name) continue;
-    const id = entity.id ?? `entity:${name.toLowerCase()}`;
+    const id = entity.id ?? `entity:${normalizeEntity(name)}`;
     addNode({ id, kind: "entity", label: truncate(name, 32), detail: entity.type });
   }
 

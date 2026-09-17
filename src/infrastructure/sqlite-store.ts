@@ -1,13 +1,6 @@
 /**
  * SQLite-backed memory store with FTS5 full-text search.
- *
- * WAL mode for concurrent reads, FTS5 for fast lexical search,
- * prepared statement cache for repeated queries.
- *
- * Data model:
- *   memories  — fact_key, version_id, text, corpus, valid_from/to, status, agent, reason
- *   relations — from_id → to_id (supersedes edges for graph traversal)
- *   feedback  — request_id, rating, ground_truth
+ * WAL mode, prepared statement cache, lifecycle-aware scoring.
  */
 
 import Database from "better-sqlite3";
@@ -28,12 +21,11 @@ import type {
 import {
   memoryStrength,
   lifecycleScoreModifier,
+  stalenessLabel,
   TTL_DAYS,
   type ConsolidationCandidate,
   type ConsolidationResult,
 } from "./lifecycle.js";
-
-// ── SQL constants ────────────────────────────────────────────────────────────
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS memories (
@@ -54,18 +46,12 @@ const SCHEMA = `
     strength      REAL DEFAULT 1.0,
     access_count  INTEGER DEFAULT 0,
     last_accessed TEXT,
+    signal        REAL DEFAULT 0,
     metadata      TEXT DEFAULT '{}',
     relations     TEXT DEFAULT '[]',
     created_at    TEXT DEFAULT (datetime('now')),
     updated_at    TEXT DEFAULT (datetime('now'))
   );
-
-  CREATE INDEX IF NOT EXISTS idx_memories_fact_key    ON memories(fact_key);
-  CREATE INDEX IF NOT EXISTS idx_memories_status      ON memories(status);
-  CREATE INDEX IF NOT EXISTS idx_memories_collection  ON memories(collection);
-  CREATE INDEX IF NOT EXISTS idx_memories_valid_from  ON memories(valid_from);
-  CREATE INDEX IF NOT EXISTS idx_memories_valid_to    ON memories(valid_to);
-  CREATE INDEX IF NOT EXISTS idx_memories_corpus      ON memories(corpus);
 
   CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     text, fact_key,
@@ -92,8 +78,6 @@ const SCHEMA = `
     reason      TEXT,
     created_at  TEXT DEFAULT (datetime('now'))
   );
-  CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_id);
-  CREATE INDEX IF NOT EXISTS idx_relations_to   ON relations(to_id);
 
   CREATE TABLE IF NOT EXISTS feedback (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,8 +86,30 @@ const SCHEMA = `
     feedback     TEXT,
     source       TEXT DEFAULT 'agent',
     ground_truth TEXT,
-    created_at   TEXT DEFAULT (datetime('now'))
+    created_at  TEXT DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS query_failures (
+    pattern    TEXT PRIMARY KEY,
+    fails      INTEGER DEFAULT 1,
+    last_at    TEXT DEFAULT (datetime('now'))
+  );
+`;
+
+/** Column-dependent indexes: run AFTER migrate() so legacy DBs have the columns. */
+const INDEXES = `
+  CREATE INDEX IF NOT EXISTS idx_memories_fact_key    ON memories(fact_key);
+  CREATE INDEX IF NOT EXISTS idx_memories_status      ON memories(status);
+  CREATE INDEX IF NOT EXISTS idx_memories_collection  ON memories(collection);
+  CREATE INDEX IF NOT EXISTS idx_memories_valid_from  ON memories(valid_from);
+  CREATE INDEX IF NOT EXISTS idx_memories_valid_to    ON memories(valid_to);
+  CREATE INDEX IF NOT EXISTS idx_memories_corpus      ON memories(corpus);
+  CREATE INDEX IF NOT EXISTS idx_memories_coll_status ON memories(collection, status);
+  CREATE INDEX IF NOT EXISTS idx_memories_type        ON memories(memory_type);
+  CREATE INDEX IF NOT EXISTS idx_memories_created     ON memories(created_at);
+  CREATE INDEX IF NOT EXISTS idx_memories_signal      ON memories(signal);
+  CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(from_id);
+  CREATE INDEX IF NOT EXISTS idx_relations_to   ON relations(to_id);
   CREATE INDEX IF NOT EXISTS idx_feedback_request ON feedback(request_id);
 `;
 
@@ -111,8 +117,8 @@ const INSERT_MEMORY = `
   INSERT INTO memories (
     id, text, corpus, collection, fact_key, version_id,
     valid_from, valid_to, status, agent, reason, memory_type,
-    trust, source_ref, metadata, relations, updated_at
-  ) VALUES (?, ?, 'memory', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    trust, source_ref, strength, metadata, relations, updated_at
+  ) VALUES (?, ?, 'memory', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
   ON CONFLICT(id) DO UPDATE SET
     text = excluded.text,
     fact_key = excluded.fact_key,
@@ -161,7 +167,7 @@ const SELECT_FTS = (where: string) => `
   FROM memories_fts fts
   JOIN memories m ON m.rowid = fts.rowid
   ${where}
-  AND fts.text MATCH ?
+  AND memories_fts MATCH ?
   ORDER BY fts.rank
   LIMIT ?
 `;
@@ -182,7 +188,46 @@ const SELECT_RECENT = (where: string) => `
   LIMIT ?
 `;
 
-// ── Score normalization ──────────────────────────────────────────────────────
+/** Signal delta for a positive rating (memory was useful). */
+const SIGNAL_POSITIVE = 0.2;
+/** Signal delta for a negative rating (memory was misleading). */
+const SIGNAL_NEGATIVE = -0.3;
+/** Weight of signal in the final retrieval score. */
+const SIGNAL_WEIGHT = 0.15;
+
+/** Extract explicit memory ids from feedback ground truth ({source_ids}). */
+function parseSignalIds(groundTruth: unknown): string[] {
+  if (!groundTruth || typeof groundTruth !== "object") return [];
+  const ids = (groundTruth as Record<string, unknown>).source_ids;
+  if (!Array.isArray(ids)) return [];
+  return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
+const SYNONYMS: Record<string, string> = {
+  db: "database",
+  postgres: "postgresql",
+  psql: "postgresql",
+  mongo: "mongodb",
+  k8s: "kubernetes",
+  js: "javascript",
+  ts: "typescript",
+  golang: "go",
+  repo: "repository",
+  auth: "authentication",
+  config: "configuration",
+  docs: "documentation",
+  perf: "performance",
+  deploy: "deployment",
+};
+
+function expandTerms(query: string): string {
+  const words = query.replace(/[^\w\s]/g, " ").split(/\s+/).filter((t) => t.length > 1);
+  const expanded = words.flatMap((w) => {
+    const syn = SYNONYMS[w.toLowerCase()];
+    return syn && syn !== w.toLowerCase() ? [`${w}*`, `${syn}*`] : [`${w}*`];
+  });
+  return [...new Set(expanded)].join(" OR ");
+}
 
 function normalizeFtsScore(rank: number): number {
   return Math.min(1, Math.abs(rank) / 10);
@@ -194,23 +239,13 @@ function recencyBoost(validFrom: string | null): number {
   return Math.max(0, 1 - daysSince / 365) * 0.15;
 }
 
-/**
- * TTL filter derived from lifecycle.TTL_DAYS (single source of truth).
- * Types with null TTL persist; others must be younger than their TTL.
- */
+/** TTL filter derived from lifecycle.TTL_DAYS. Fail-open: unknown types persist. */
 function ttlCondition(): string {
-  const persistent = Object.entries(TTL_DAYS)
-    .filter(([, ttl]) => ttl === null)
-    .map(([type]) => `'${type}'`)
-    .join(",");
-  const expiring = Object.entries(TTL_DAYS)
+  const clauses = Object.entries(TTL_DAYS)
     .filter(([, ttl]) => ttl !== null)
-    .map(([type, ttl]) => `(m.memory_type = '${type}' AND datetime(m.created_at, '+${ttl} days') > datetime('now'))`)
-    .join(" OR ");
-  return `(m.memory_type IS NULL OR m.memory_type IN (${persistent})${expiring ? ` OR ${expiring}` : ""})`;
+    .map(([type, ttl]) => `(m.memory_type != '${type}' OR datetime(m.created_at, '+${ttl} days') > datetime('now'))`);
+  return clauses.length ? `(${clauses.join(" AND ")})` : `(1 = 1)`;
 }
-
-// ── Store ────────────────────────────────────────────────────────────────────
 
 export interface SqliteStoreOptions {
   path: string;
@@ -221,7 +256,6 @@ export class SqliteStore implements HydraDBLike {
   private db: Database.Database;
   private schemaReady = false;
 
-  // Prepared statement cache — avoids re-preparing on every call
   private stmts = new Map<string, Database.Statement>();
 
   constructor(private readonly opts: SqliteStoreOptions) {
@@ -235,13 +269,12 @@ export class SqliteStore implements HydraDBLike {
     this.db.pragma("busy_timeout = 5000");
   }
 
-  // ── Schema ──────────────────────────────────────────────────────────────
-
   private init(): void {
     if (this.schemaReady) return;
     this.schemaReady = true;
     this.db.exec(SCHEMA);
     this.migrate();
+    this.db.exec(INDEXES);
   }
 
   /**
@@ -256,14 +289,27 @@ export class SqliteStore implements HydraDBLike {
     const addColumn = (name: string, ddl: string) => {
       if (!existing.has(name)) this.db.exec(`ALTER TABLE memories ADD COLUMN ${ddl}`);
     };
-    addColumn("strength", `strength REAL DEFAULT 1.0`);
-    addColumn("access_count", `access_count INTEGER DEFAULT 0`);
-    addColumn("last_accessed", `last_accessed TEXT`);
+    // Every column ever added, oldest first — DBs from any version migrate.
+    addColumn("corpus", `corpus TEXT NOT NULL DEFAULT 'memory'`);
+    addColumn("collection", `collection TEXT NOT NULL DEFAULT 'default'`);
+    addColumn("fact_key", `fact_key TEXT`);
+    addColumn("version_id", `version_id TEXT`);
+    addColumn("valid_from", `valid_from TEXT`);
+    addColumn("valid_to", `valid_to TEXT`);
+    addColumn("status", `status TEXT DEFAULT 'current'`);
+    addColumn("agent", `agent TEXT`);
+    addColumn("reason", `reason TEXT`);
     addColumn("memory_type", `memory_type TEXT`);
     addColumn("trust", `trust TEXT`);
     addColumn("source_ref", `source_ref TEXT`);
-    addColumn("reason", `reason TEXT`);
-    addColumn("agent", `agent TEXT`);
+    addColumn("strength", `strength REAL DEFAULT 1.0`);
+    addColumn("access_count", `access_count INTEGER DEFAULT 0`);
+    addColumn("last_accessed", `last_accessed TEXT`);
+    addColumn("signal", `signal REAL DEFAULT 0`);
+    addColumn("metadata", `metadata TEXT DEFAULT '{}'`);
+    addColumn("relations", `relations TEXT DEFAULT '[]'`);
+    addColumn("created_at", `created_at TEXT DEFAULT (datetime('now'))`);
+    addColumn("updated_at", `updated_at TEXT DEFAULT (datetime('now'))`);
     // Rows inserted before the FTS table existed are invisible to MATCH.
     // Rebuild is idempotent and cheap on small stores.
     this.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`);
@@ -278,8 +324,6 @@ export class SqliteStore implements HydraDBLike {
     return s;
   }
 
-  // ── HydraDBLike: lifecycle ──────────────────────────────────────────────
-
   async createDatabase(_database: string): Promise<void> { this.init(); }
   async awaitDatabaseReady(_d: string, _m?: number, _i?: number): Promise<void> { this.init(); }
   async databaseStatus(_d: string): Promise<{ ready: boolean; raw: unknown }> {
@@ -293,16 +337,29 @@ export class SqliteStore implements HydraDBLike {
     catch (e) { return { reachable: false, authed: false, latencyMs: Date.now() - t, error: (e as Error).message }; }
   }
 
-  // ── HydraDBLike: ingest ─────────────────────────────────────────────────
-
   async ingestMemory(input: IngestMemoryInput): Promise<IngestResult> {
     this.init();
     const ids: string[] = [];
 
     this.db.transaction(() => {
       for (const item of input.memories) {
+        const text = item.text ?? "";
+        // Verbatim re-ingest (e.g. session re-capture) with no stable id:
+        // reuse the existing row instead of duplicating.
+        if (!item.id) {
+          const dupe = this.prepared(
+            `SELECT id FROM memories WHERE collection = ? AND status = 'current' AND text = ? LIMIT 1`,
+          ).get(input.collection, text) as { id: string } | undefined;
+          if (dupe) {
+            this.recordAccessInTxn(dupe.id);
+            ids.push(dupe.id);
+            continue;
+          }
+        }
+
         const id = item.id ?? `mem_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const md = item.additional_metadata ?? {};
+        const initialStrength = memoryStrength(new Date().toISOString(), (md.memory_type as string) ?? null, 0, null);
 
         this.prepared(INSERT_MEMORY).run(
           id, item.text ?? "", input.collection,
@@ -310,14 +367,24 @@ export class SqliteStore implements HydraDBLike {
           md.valid_from ?? null, md.valid_to ?? null,
           md.status ?? "current", md.agent ?? null,
           md.reason ?? null, md.memory_type ?? null,
-          md.trust ?? null, md.source_ref ?? null,
+          md.trust ?? null, md.source_ref ?? null, initialStrength,
           JSON.stringify(md), JSON.stringify(item.relations?.ids ?? []),
         );
 
-        if (item.relations?.ids?.length && item.relations.properties?.type === "supersedes") {
-          for (const toId of item.relations.ids) {
-            this.prepared(INSERT_RELATION).run(id, toId, "supersedes", item.relations.properties.reason ?? null);
+        const relType = item.relations?.ids?.length ? (item.relations.properties?.type as string ?? "relates") : null;
+        if (relType) {
+          for (const toId of item.relations!.ids!) {
+            this.prepared(INSERT_RELATION).run(id, toId, relType, (item.relations!.properties?.reason as string | undefined) ?? null);
           }
+        }
+
+        if (md.memory_type === "correction") {
+          this.prepared(
+            `UPDATE memories
+             SET signal = MIN(1.0, COALESCE(signal, 0) + ?),
+                 updated_at = datetime('now')
+             WHERE id = ?`,
+          ).run(SIGNAL_POSITIVE, id);
         }
 
         ids.push(id);
@@ -339,7 +406,7 @@ export class SqliteStore implements HydraDBLike {
 
         this.prepared(INSERT_KNOWLEDGE).run(
           id, text, input.collection ?? "default",
-          null, id, null, doc.url ?? null,
+          null, id, doc.url ?? null,
           JSON.stringify({ ...md, source_ref: doc.url, timestamp: doc.timestamp }),
         );
         ids.push(id);
@@ -348,8 +415,6 @@ export class SqliteStore implements HydraDBLike {
 
     return { ids, ok: true, requestId: `req_${Date.now().toString(36)}` };
   }
-
-  // ── HydraDBLike: index status ───────────────────────────────────────────
 
   async awaitIndexed(ids: string[]): Promise<boolean> {
     this.init();
@@ -360,8 +425,6 @@ export class SqliteStore implements HydraDBLike {
     this.init();
     return { statuses: ids.map((id) => ({ id, indexing_status: "ready" })), raw: { engine: "sqlite" } };
   }
-
-  // ── HydraDBLike: relations ──────────────────────────────────────────────
 
   async contextRelations(scope: ContextScope, ids?: string[]): Promise<HydraRelations> {
     this.init();
@@ -383,23 +446,26 @@ export class SqliteStore implements HydraDBLike {
     };
   }
 
-  // ── HydraDBLike: query ──────────────────────────────────────────────────
-
   async query(input: QueryInput): Promise<QueryResult> {
     this.init();
     const collection = input.collection ?? "default";
     const maxResults = input.max_results ?? 15;
     const query = (input.query ?? "").trim();
 
-    // Build WHERE clause
-    const conditions = ["m.collection = ?"];
-    const params: unknown[] = [collection];
+    // Global scope: user-level memories visible from every collection.
+    const collections = collection === "global" ? [collection] : [collection, "global"];
+    const conditions = [`m.collection IN (${collections.map(() => "?").join(",")})`];
+    const params: unknown[] = [...collections];
 
     if (input.type && input.type !== "all") {
       conditions.push("m.corpus = ?");
       params.push(input.type);
     }
-    conditions.push("(m.status IS NULL OR m.status NOT IN ('forgotten', 'superseded'))");
+    if (input.metadata_filters?.include_superseded || input.metadata_filters?.as_of) {
+      conditions.push("(m.status IS NULL OR m.status NOT IN ('forgotten'))");
+    } else {
+      conditions.push("(m.status IS NULL OR m.status NOT IN ('forgotten', 'superseded'))");
+    }
 
     if (input.metadata_filters?.as_of) {
       conditions.push("m.valid_from <= ?");
@@ -413,18 +479,17 @@ export class SqliteStore implements HydraDBLike {
     const where = `WHERE ${conditions.join(" AND ")}`;
     const limit = Math.min(maxResults * 3, 200);
 
-    // Execute search
     const rows = query ? this.searchFts(query, where, params, limit) : this.searchRecent(where, params, limit);
 
-    // Score + rank with lifecycle-aware scoring
     const scored = rows
       .map((r) => {
         const ftsScore = r.score < 0 ? normalizeFtsScore(r.score) : r.score;
         const lifecycle = lifecycleScoreModifier(
           r.created_at, r.memory_type, r.access_count ?? 0, r.last_accessed, r.status,
         );
-        // Combine FTS relevance with lifecycle strength
-        const score = ftsScore * 0.7 + lifecycle * 0.3 + recencyBoost(r.valid_from);
+        // FTS relevance + lifecycle strength + learned feedback signal
+        const score = ftsScore * 0.7 + lifecycle * 0.3
+          + recencyBoost(r.valid_from) + (r.signal ?? 0) * SIGNAL_WEIGHT;
         return { ...r, score, lifecycle_strength: lifecycle };
       })
       .sort((a, b) => b.score - a.score);
@@ -442,16 +507,48 @@ export class SqliteStore implements HydraDBLike {
           trust: r.trust, source_ref: r.source_ref,
           strength: r.lifecycle_strength ?? r.strength,
           access_count: r.access_count, last_accessed: r.last_accessed,
-          created_at: r.created_at,
+          created_at: r.created_at, signal: r.signal ?? 0,
+          staleness: stalenessLabel(r.created_at),
         },
       };
     });
 
+    if (input.mode === "thinking" || input.graph_context === true) {
+      chunks.push(...this.expandRelations(chunks, collection, maxResults));
+    }
+
     return { chunks, requestId: `req_${Date.now().toString(36)}`, latencyMs: 0, raw: { engine: "sqlite", path: this.opts.path } };
   }
 
+  /** 1-hop relation expansion for thinking mode: linked memories at half score. */
+  private expandRelations(chunks: QueryChunk[], collection: string, maxResults: number): QueryChunk[] {
+    const seen = new Set(chunks.map((c) => c.id));
+    const out: QueryChunk[] = [];
+    for (const chunk of chunks) {
+      if (out.length + chunks.length >= maxResults) break;
+      const linked = this.db.prepare(
+        `SELECT m.* FROM relations r
+         JOIN memories m ON m.id = CASE WHEN r.from_id = ? THEN r.to_id ELSE r.from_id END
+         WHERE (r.from_id = ? OR r.to_id = ?) AND m.collection = ? AND m.status = 'current'
+         LIMIT 3`,
+      ).all(chunk.id, chunk.id, chunk.id, collection) as Row[];
+      for (const row of linked) {
+        if (seen.has(row.id)) continue;
+        seen.add(row.id);
+        let md: Record<string, unknown> = {};
+        try { md = JSON.parse(row.metadata); } catch { /* ignore */ }
+        out.push({
+          id: row.id, text: row.text, content: row.text,
+          corpus: row.corpus as "memory" | "knowledge", score: (chunk.score ?? 0) * 0.5,
+          metadata: { ...md, fact_key: row.fact_key, via_relation: chunk.id },
+        });
+      }
+    }
+    return out;
+  }
+
   private searchFts(query: string, where: string, params: unknown[], limit: number) {
-    const terms = query.replace(/[^\w\s]/g, " ").split(/\s+/).filter((t) => t.length > 1).map((t) => `${t}*`).join(" OR ");
+    const terms = expandTerms(query);
     if (!terms) return this.searchLike(query, where, params, limit);
 
     try {
@@ -470,17 +567,56 @@ export class SqliteStore implements HydraDBLike {
     return this.db.prepare(SELECT_RECENT(where)).all(...params, limit) as Row[];
   }
 
-  // ── HydraDBLike: feedback ───────────────────────────────────────────────
-
   async feedback(input: FeedbackInput): Promise<void> {
     this.init();
     this.prepared(`INSERT INTO feedback (request_id, rating, feedback, source, ground_truth) VALUES (?, ?, ?, ?, ?)`)
       .run(input.request_id, input.rating ?? null, input.feedback ?? null, input.source ?? "agent", input.ground_truth ? JSON.stringify(input.ground_truth) : null);
+
+    // Close the loop: ratings adjust per-memory signal used in ranking.
+    const delta = input.rating === "positive" ? SIGNAL_POSITIVE
+      : input.rating === "negative" ? SIGNAL_NEGATIVE : 0;
+    if (delta !== 0) {
+      const ids = parseSignalIds(input.ground_truth);
+      if (ids.length) this.applySignal(ids, delta);
+    }
+
+    if (input.rating === "negative" && input.metadata?.query?.trim()) {
+      const pattern = input.metadata.query.toLowerCase().replace(/\s+/g, " ").trim().slice(0, 120);
+      this.prepared(
+        `INSERT INTO query_failures (pattern, fails, last_at) VALUES (?, 1, datetime('now'))
+         ON CONFLICT(pattern) DO UPDATE SET fails = fails + 1, last_at = datetime('now')`,
+      ).run(pattern);
+    }
   }
 
-  // ── Lifecycle ───────────────────────────────────────────────────────────
+  /** Top failing query patterns for Dream gap analysis. */
+  getQueryFailures(limit = 10): Array<{ pattern: string; fails: number }> {
+    this.init();
+    return this.db.prepare(
+      `SELECT pattern, fails FROM query_failures ORDER BY fails DESC, last_at DESC LIMIT ?`,
+    ).all(limit) as Array<{ pattern: string; fails: number }>;
+  }
 
-  /** Record that a memory was accessed (boosts reinforcement). */
+  /**
+   * Adjust retrieval signal for explicit memory ids.
+   * Positive = useful (rank higher), negative = misleading (rank lower).
+   * Clamped to [-1, 1]. Used by feedback() and correction learning.
+   */
+  applySignal(ids: string[], delta: number): void {
+    this.init();
+    this.db.transaction(() => {
+      for (const id of ids) {
+        this.prepared(
+          `UPDATE memories
+           SET signal = MIN(1.0, MAX(-1.0, COALESCE(signal, 0) + ?)),
+               updated_at = datetime('now')
+           WHERE id = ?`,
+        ).run(delta, id);
+      }
+    })();
+  }
+
+  /** Record access: bumps count + timestamp for reinforcement. */
   recordAccess(id: string): void {
     this.init();
     this.prepared(
@@ -488,7 +624,12 @@ export class SqliteStore implements HydraDBLike {
     ).run(id);
   }
 
-  /** Get lifecycle statistics: count by type, avg strength, stale count. */
+  private recordAccessInTxn(id: string): void {
+    this.prepared(
+      `UPDATE memories SET access_count = access_count + 1, last_accessed = datetime('now'), updated_at = datetime('now') WHERE id = ?`,
+    ).run(id);
+  }
+
   getLifecycleStats(collection: string = "default"): {
     total: number;
     byType: Record<string, number>;
@@ -528,7 +669,6 @@ export class SqliteStore implements HydraDBLike {
     };
   }
 
-  /** Get candidates for consolidation (all current memories with strength). */
   getConsolidationCandidates(collection: string = "default"): ConsolidationCandidate[] {
     this.init();
     return this.db.prepare(
@@ -538,7 +678,6 @@ export class SqliteStore implements HydraDBLike {
     ).all(collection) as ConsolidationCandidate[];
   }
 
-  /** Apply a consolidation result: prune, mark expired, update strengths. */
   applyConsolidation(result: ConsolidationResult): { pruned: number; expired: number } {
     this.init();
     let pruned = 0;
@@ -576,23 +715,72 @@ export class SqliteStore implements HydraDBLike {
     return { pruned, expired };
   }
 
-  /** Update strength for all memories (time-decay pass). Called periodically. */
-  updateStrengths(collection: string = "default"): number {
+  updateStrengths(collection: string = "default", onlyStaleOlderThanHours = 0): number {
     this.init();
     const rows = this.db.prepare(
-      `SELECT id, created_at, memory_type, access_count, last_accessed FROM memories WHERE collection = ? AND status = 'current'`,
-    ).all(collection) as Array<{ id: string; created_at: string; memory_type: string | null; access_count: number; last_accessed: string | null }>;
+      `SELECT id, created_at, memory_type, access_count, last_accessed, strength, updated_at
+       FROM memories WHERE collection = ? AND status = 'current'`,
+    ).all(collection) as Array<{
+      id: string; created_at: string; memory_type: string | null;
+      access_count: number; last_accessed: string | null;
+      strength: number; updated_at: string;
+    }>;
 
-    let updated = 0;
+    const cutoff = Date.now() - onlyStaleOlderThanHours * 3_600_000;
+    const due = rows.filter((r) => {
+      if (onlyStaleOlderThanHours <= 0) return true;
+      if (Date.parse(r.updated_at) <= cutoff) return true;
+      return Math.abs((r.strength ?? 1) - memoryStrength(r.created_at, r.memory_type, r.access_count, r.last_accessed)) >= 0.01;
+    });
+
     this.db.transaction(() => {
-      for (const r of rows) {
+      for (const r of due) {
         const strength = memoryStrength(r.created_at, r.memory_type, r.access_count, r.last_accessed);
         this.prepared(`UPDATE memories SET strength = ?, updated_at = datetime('now') WHERE id = ?`).run(strength, r.id);
-        updated++;
       }
     })();
 
-    return updated;
+    return due.length;
+  }
+
+  /** Unfinished work: current tasks, never accessed, older than 7 days. */
+  getOpenLoops(collection: string = "default"): Array<{ id: string; text: string; created_at: string; age_days: number }> {
+    this.init();
+    return this.db.prepare(
+      `SELECT id, text, created_at,
+              CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS age_days
+       FROM memories
+       WHERE collection = ? AND status = 'current' AND memory_type = 'task'
+         AND COALESCE(access_count, 0) = 0
+         AND datetime(created_at, '+7 days') <= datetime('now')
+       ORDER BY created_at ASC
+       LIMIT 50`,
+    ).all(collection) as Array<{ id: string; text: string; created_at: string; age_days: number }>;
+  }
+
+  /** Auto-resolve correction chains: newest correction per fact_key wins, rest superseded. */
+  resolveContradictions(collection: string = "default"): number {
+    this.init();
+    const rows = this.db.prepare(
+      `SELECT id, fact_key, created_at FROM memories
+       WHERE collection = ? AND status = 'current' AND memory_type = 'correction' AND fact_key IS NOT NULL
+       ORDER BY fact_key, created_at DESC`,
+    ).all(collection) as Array<{ id: string; fact_key: string; created_at: string }>;
+
+    const seen = new Set<string>();
+    const losers: string[] = [];
+    for (const r of rows) {
+      if (seen.has(r.fact_key)) losers.push(r.id);
+      else seen.add(r.fact_key);
+    }
+
+    this.db.transaction(() => {
+      for (const id of losers) {
+        this.prepared(`UPDATE memories SET status = 'superseded', updated_at = datetime('now') WHERE id = ?`).run(id);
+      }
+    })();
+
+    return losers.length;
   }
 
   close(): void {
@@ -601,8 +789,6 @@ export class SqliteStore implements HydraDBLike {
   }
 }
 
-// ── Internal types ───────────────────────────────────────────────────────────
-
 interface Row {
   id: string; text: string; corpus: string; fact_key: string | null;
   version_id: string | null; valid_from: string | null; valid_to: string | null;
@@ -610,5 +796,6 @@ interface Row {
   memory_type: string | null; trust: string | null; source_ref: string | null;
   metadata: string; score: number; created_at: string;
   strength: number; access_count: number; last_accessed: string | null;
+  signal: number | null;
   lifecycle_strength?: number;
 }
