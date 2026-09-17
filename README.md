@@ -2,47 +2,99 @@
 
 **Local-first memory for coding agents.**
 
-Lorex gives Claude Code, Cursor, Codex, and Windsurf a shared memory that
-survives sessions — decisions, preferences, and architecture context — stored
-locally in SQLite. No cloud, no API key, no setup. Install, wire, done.
+Lorex is a memory and context layer that sits between your coding agents
+(Claude Code, Cursor, Codex, Windsurf) and their work. Every agent that touches
+a project reads from and writes to the same persistent store, so knowledge
+survives across sessions, across agents, and across machines — without anything
+ever leaving your machine.
 
-```bash
-npm install -g @lorex/cli
-lorex wire      # connect this project to your agents
+Paste a whole chat history back into context and you pay for 100k+ tokens of
+noise — and the model still can't tell which facts are current. Lorex ingests
+sessions, extracts the durable facts, versions them, and serves back only the
+relevant, current context when an agent asks.
+
+```
+$ lorex why --factId session_store
+- 2026-01-10: We use MongoDB for session storage
+- 2026-02-02: MongoDB → Redis — because Atlas kept timing out under load
 ```
 
 ## Why local-first
 
-Cloud memory tools (Mem0, Zep, Supermemory) need an API key, a network
-connection, and trust that your code context leaves the machine. Lorex keeps
-everything in `~/.lorex/` — inspectable, backup-able, portable, private.
+Cloud memory tools need an API key, a network connection, and trust that your
+code context leaves the building. Lorex keeps everything in `~/.lorex/`:
+a single SQLite file you can inspect, back up, copy, and delete.
 
-SQLite + FTS5 gives fast lexical search, WAL mode gives concurrent reads,
-and prepared statements keep latency in single-digit milliseconds. Optional
-cloud sync is a future phase, not a dependency.
+SQLite + FTS5 gives fast lexical search with stemming, WAL mode gives
+concurrent readers, prepared statements keep queries in single-digit
+milliseconds. No Docker, no Postgres, no vector database, no account.
+
+```
+$ lorex add "Session storage moved to Redis because Atlas kept timing out"
+$ lorex ask "what do we use for sessions?"
+Redis — session storage moved from MongoDB because Atlas kept timing out.
+```
 
 ## What it does
 
-- **Shared across agents** — Claude Code records a decision; Cursor picks it
-  up from the same workspace with attribution.
-- **Temporal** — facts are versioned. Ask `asOf` a past date and the old value
-  *is* the answer.
-- **Causal** — changes record *why* at write time (`because`), rendered later
-  by `lorex why`.
-- **Alive** — memories have a lifecycle. Episodes decay (90-day half-life),
-  preferences strengthen with repetition, tasks expire, stale facts are pruned.
-- **Dreaming** — background extraction finds repeated patterns, recurring
-  topics, and correction chains across sessions.
-- **Honest** — if stored evidence doesn't support a question, Lorex abstains
-  instead of guessing.
-- **Evidence-backed** — every operation returns a receipt: sources, scores,
-  compression stats, abstention reason.
+- **Shared across agents** — Claude Code records a decision; Codex on another
+  machine picks it up from the same workspace with attribution.
+- **Temporal** — facts are versioned. When session storage moved from MongoDB
+  to Redis, Lorex knows Redis is current and MongoDB is history. Ask `asOf` a
+  past date and the old value *is* the answer.
+- **Causal** — changes record *why* at write time (`because`), not rediscovered
+  later by re-reading transcripts.
+- **Alive** — memories have a lifecycle, not just a row. Episodes decay on a
+  90-day half-life, preferences strengthen each time they're repeated, tasks
+  expire after 30 days, stale facts get pruned, and a background Dream pass
+  finds repeated patterns, recurring topics, and correction chains.
+- **Learning** — retrieval feedback (`report`) adjusts per-memory signal, so
+  useful memories rank higher and misleading ones sink. Corrections that
+  supersede old versions reinforce themselves.
+- **Evidence-backed** — every operation returns a receipt: sources used,
+  scores, compression stats, abstention reason. Answers are auditable.
+- **Honest** — if the stored evidence doesn't support a question, Lorex
+  abstains instead of guessing. Sources are still returned; withholding the
+  claim and withholding the evidence are separate decisions.
+- **Scoped** — `global` scope holds user-level preferences visible from every
+  project; project collections stay isolated from each other.
+- **Safe to run unattended** — persisted rate limits and ingestion budgets stop
+  a runaway agent from melting the local store.
 
-## Current plan
+## The harness (where this is going)
 
-Build order: CLI (for coding agents) → MCP → SDK. The harness layer
-(automatic capture/injection via agent hooks) is the long-term direction;
-the memory engine underneath is what we're finishing now.
+Tools the agent must remember to call don't get called. The harness flips
+it: memory happens automatically, the agent never knows it's there.
+
+```
+Human types: "claude"
+      │
+      ▼
+┌─────────────┐
+│ Agent runs  │  ← Claude Code, Cursor, Codex, Windsurf — unmodified
+│ normally    │
+└──────┬──────┘
+       │  lifecycle hooks fire
+       ▼
+┌─────────────────────────────────┐
+│ Lorex harness (invisible layer) │
+│                                 │
+│ SessionStart → recall relevant  │  inject memory into context
+│ PostToolUse  → capture facts    │  extract + store silently
+│ Stop         → save turn        │  facts + session state
+│ PreCompact   → backup context   │  survive the wipe
+│ SessionEnd   → consolidate      │  handoff for next agent
+└──────────────┬──────────────────┘
+               ▼
+┌─────────────────────────────────┐
+│ Memory engine (this repo)       │
+│ SQLite + FTS5 · typed facts     │
+│ lifecycle · dream · signals     │
+│ abstention · causality          │
+└─────────────────────────────────┘
+```
+
+Build order: CLI (for coding agents) → MCP → SDK → harness.
 
 ```
 Phase 1 (now):   local SQLite engine + lifecycle + dream + CLI
@@ -50,26 +102,38 @@ Phase 2 (next):  harness — hooks as primary flow, CLI as debug surface
 Phase 3 (later): optional sync via write-queue replay
 ```
 
+Design rules:
+
+- **Fail-open** — any hook error is a silent no-op; the session proceeds
+  without memory rather than blocking the agent.
+- **One-shot injection** — memory loads once at session start, not every
+  turn. Keeps LLM cache stable and avoids responding to the memory block
+  instead of the user.
+- **Keyless by default** — capture, recall, lifecycle, and Dream all work
+  with zero LLM calls. LLM extraction/synthesis stay opt-in.
+- **CLI as debug surface** — once the harness is primary, `lorex doctor`,
+  `lorex list`, and `lorex graph` exist for humans to inspect what the
+  harness did, not as the way memory gets written.
+
+`lorex wire` + `lorex hooks install` are the first slice of this: they write
+the agent configs today so SessionStart/Stop hooks already load and save
+memory. The full harness (per-tool-call capture, compaction survival,
+cross-agent handoff) builds on the same hook points.
+
 ## Quick start
 
 ```bash
 npm install -g @lorex/cli
 lorex local     # start the HTTP memory API on 127.0.0.1:3777
-lorex wire      # write .mcp.json for Claude/Cursor/Windsurf
+lorex wire      # write .mcp.json so Claude/Cursor/Windsurf pick up memory
 lorex hooks install --agent claude-code   # auto-load memory every session
-lorex doctor    # verify setup with a smoke test
+lorex doctor    # verifies setup with a smoke test
 ```
+
+Node.js ≥ 20. No API key, no account, no network. Everything below runs
+offline against the bundled SQLite backend.
 
 ## Using it
-
-### From the shell
-
-```bash
-lorex add "Session storage moved to Redis because Atlas kept timing out"
-lorex ask "what do we use for sessions?"
-lorex why --factId session_store
-lorex resume --plain
-```
 
 ### From an agent (MCP)
 
@@ -79,45 +143,174 @@ lorex start     # MCP server over stdio
 
 | Tool | What it does |
 |------|--------------|
-| `recall` | Query memory (`asOf`, `mode`, opt-in `synthesize`) |
-| `remember` | Store a fact — `id` for supersession, `because` for the reason |
-| `why` | Walk a fact's supersession chain |
-| `handoff` | Record a decision + next step for the next agent |
-| `resume` | Session-start pack with attribution + latest handoff |
-| `history` | Full version timeline for a fact |
-| `learn` | Store grounding content verbatim |
+| `recall` | Query memory (`asOf`, `mode`, opt-in `synthesize`); returns the pack, compression stats, and abstention |
+| `remember` | Store a fact — `id` for supersession, `because` for the causal reason, `scope: global` for user-level prefs |
+| `why` | Walk a fact's supersession chain and return the recorded reasons |
+| `handoff` | Record a decision and the next step for whichever agent comes next |
+| `resume` | Session-start pack with cross-agent attribution and the latest handoff |
+| `history` | Full version timeline for a fact, including superseded versions |
+| `learn` | Store grounding content verbatim (runbooks, docs, transcripts) |
 | `list` | Snapshot of recent items |
-| `forget` | Soft-delete a fact topic |
-| `report` | Send retrieval feedback |
-| `capture_session` | Ingest a full chat session |
-| `usage` | Rate-limit consumption + pending queue |
+| `forget` | Soft-delete a fact topic (confidence-gated, history preserved) |
+| `report` | Send retrieval feedback — adjusts future ranking |
+| `capture_session` | Ingest a full chat session through the pipeline |
+| `usage` | Show rate-limit consumption and pending write queue |
+
+### From the shell
+
+```bash
+lorex add "Session storage moved to Redis because Atlas kept timing out"
+lorex ask "what do we use for sessions?"
+lorex remember --fact "Session storage moved to Redis" --id session_store \
+               --because "Atlas kept timing out under load"
+lorex recall   --query "what do we use for sessions?"
+lorex why      --factId session_store
+lorex history  --factId session_store
+lorex graph    --query "what changed and why" --out graph.html
+lorex resume --plain
+lorex usage
+```
 
 ### From TypeScript
 
 ```ts
 import { Lorex } from "@lorex/cli/dist/client.js";
-const lorex = new Lorex();
+
+const lorex = new Lorex(); // http://127.0.0.1:3777
 await lorex.add("We use Postgres for analytics");
 const r = await lorex.search("which database for analytics?");
+if (!r.abstained) console.log(r.answer);
+```
+
+### Memory lifecycle in practice
+
+```bash
+# Episodes fade, preferences stick, tasks expire — automatically.
+lorex remember --fact "Debugging the auth flake"        # episode: decays
+lorex remember --fact "Always use TypeScript"           # preference: strengthens
+lorex remember --fact "Rotate the staging keys"         # task: expires in 30d
+
+# Tell Lorex what helped and it ranks better next time.
+lorex report --requestId req_abc --rating positive --sourceIds v1 v2
+
+# Unfinished work surfaces instead of rotting silently.
+lorex open-loops   # (via engine.openLoops / dashboard)
+```
+
+## Shared memory across agents
+
+Without a workspace, identity is derived from git — `database` is the user,
+`collection` is the repository — so agents share memory only when they run as
+the same user on the same clone.
+
+A workspace makes it explicit and portable:
+
+```bash
+# Agent A finishes a piece of work
+LOREX_WORKSPACE=checkout lorex handoff \
+  --decision "Session storage moved to Redis; login path migrated" \
+  --next "Migrate the logout path and drop the Mongo collection"
+
+# Agent B, different machine, cold start
+LOREX_WORKSPACE=checkout lorex resume
+# → Resuming workspace "checkout" as codex. Also worked on by: claude-code.
+#   Last handoff (claude-code, 2026-02-02): Session storage moved to Redis…
+```
+
+The agent name is detected automatically (`claude-code`, `cursor`, `codex`,
+`vscode`, `github-actions`) and stamped on every write, so recall carries
+attribution. User-level preferences go one level up:
+
+```bash
+lorex remember --fact "Always respond with concise diffs" --scope global
+# visible from every project collection on this machine
 ```
 
 ## Storage
 
 Three backends implement `HydraDBLike`:
 
-| Backend | When | File |
+| Backend | When | Where |
 |---|---|---|
-| `SqliteStore` (**default**) | normal use | `~/.lorex/local-store.db` |
-| `HydraDBClient` | `--cloud` + key | remote API |
+| `SqliteStore` (**default**) | normal use — zero setup | `~/.lorex/local-store.db` |
+| `HydraDBClient` | `--cloud` + API key | remote API |
 | `MockHydraDB` | `--mock` | in-memory (tests, demos) |
 
-## Safety
+The SQLite schema: `memories` (facts + lifecycle columns), `relations`
+(supersedes/relates edges), `feedback` (ratings + ground truth),
+`query_failures` (recall-gap mining). FTS5 with porter stemming over text and
+fact keys, kept in sync by triggers. Old databases migrate automatically —
+new columns are added idempotently on open and the FTS index rebuilds.
 
-- **Rate limiting** — persisted caps on writes/queries/ingest tokens.
-- **Durable write queue** — failed writes retry from `~/.lorex/queue.jsonl`,
-  then dead-letter rather than vanish.
-- **Graceful degradation** — backend failures become `unavailable` abstentions.
-- **Soft deletes** — forgetting closes validity windows; history stays intact.
+Retrieval scoring blends FTS relevance (70%) with lifecycle strength (30%),
+plus recency boost and learned feedback signal. Thinking mode adds 1-hop
+relation expansion.
+
+## Built for production
+
+Lorex is designed to run unattended inside agents that loop:
+
+- **Rate limiting** — persisted caps on writes/hour, writes/day, queries/hour,
+  and ingest tokens/day. Configurable via environment variables; the MCP server
+  tells the agent exactly how long to wait instead of failing opaquely.
+- **Durable write queue** — failed writes retry from `~/.lorex/queue.jsonl`
+  (30s auto-flush, 5 attempts), then dead-letter to a file rather than vanish.
+- **Graceful degradation** — backend failures during recall become
+  `unavailable` abstentions, not crashes. Hook failures are fail-open.
+- **Soft deletes** — nothing is hard-deleted; forgetting closes validity
+  windows so history stays intact. Pruned/expired rows keep `status` markers.
+- **Input guards** — payload size caps, zod-validated MCP arguments, JSON body
+  cap on the HTTP server, and a confidence gate before any destructive `forget`.
+
+## Context graph & dashboard
+
+Lorex resolves entities (alias-normalized: PostgreSQL, postgres db → one
+node), maps supersession and relates edges, and stamps agent authorship:
+
+```bash
+lorex graph --query "what changed and why" --out graph.html   # static file
+lorex graph --live                                            # live, redraws as agents write
+lorex dashboard                                               # http://127.0.0.1:3000
+```
+
+Solid ring = true now; hollow = replaced; red arrow = supersedes, labelled with
+the recorded reason; gold outline = made it into the retrieved pack. The graph
+is a single self-contained HTML file. The dashboard is a local,
+token-authenticated view of stored memory with a live recall console.
+
+## Architecture
+
+```
+Agent  ──MCP/CLI/HTTP──▶  LorexEngine  ──▶  SQLite (memory + knowledge)
+                               │
+                               ├── evidence pack, budget from measured haystack
+                               ├── temporal windows + supersession chains
+                               ├── causal edges (why a value changed)
+                               ├── lifecycle (decay, TTL, consolidation, dream)
+                               ├── feedback signals + correction learning
+                               ├── abstention (claim withheld, evidence kept)
+                               ├── rate limiter + durable write queue
+                               └── cross-agent attribution + handoffs
+```
+
+```
+src/
+  domain/          session · event · fact · evidence · causality · compression
+                   graph · receipts
+  ingestion/       normalizer → deduplicator → chunker → extractor → pipeline
+                   session-capture · token-counter · language-packs
+  retrieval/       planner → hydradb-retriever → evidence-assembler
+  synthesis/       abstention · llm-synthesizer · verify
+  infrastructure/  sqlite-store (default) ⇄ hydradb-client ⇄ mock-hydradb
+                   lifecycle · dream · config · identity · limits
+                   rate-limiter · write-queue · errors · paths
+  interfaces/      cli · mcp-server · local-server · agent-hooks · client
+                   dashboard · graph-server · graph-render
+  evaluation/      longmemeval harness
+  benchmark/       local-bench (SQLite throughput/latency)
+  tests/           core · sqlite · engine-sqlite · retrieval · ingestion
+                   server · infrastructure · requirements
+```
 
 ## Configuration
 
@@ -125,19 +318,38 @@ Three backends implement `HydraDBLike`:
 |---|---|
 | `LOREX_WORKSPACE` | Shared memory across agents and machines |
 | `LOREX_AGENT` | Override the auto-detected agent name |
+| `LOREX_DATABASE` / `LOREX_COLLECTION` | Explicit identity, bypassing git derivation |
 | `LOREX_HOME` | Relocate all state; default `~/.lorex` |
-| `LOREX_NO_LIMITS` | `1` disables limiters (tests only) |
+| `LOREX_QUEUE_CAP` | Write-queue capacity (default 500) |
+| `LOREX_MAX_WRITES_PER_HOUR` / `LOREX_MAX_WRITES_PER_DAY` | Rate-limit tuning |
+| `LOREX_MAX_QUERIES_PER_HOUR` | Rate-limit tuning |
+| `LOREX_MAX_INGEST_TOKENS_PER_DAY` | Daily ingestion budget |
+| `LOREX_NO_LIMITS` | Set to `1` to disable limiters (tests/benchmarks only) |
+| `LOREX_ABSTAIN_ON_AMBIGUITY` | `1` makes recall decline when two values tie instead of flagging only |
+| `LOREX_EXTRACT` | `llm` enables LLM fact extraction (heuristic by default) |
+| `LOREX_LLM_BASE_URL` / `LOREX_LLM_API_KEY` | OpenAI-compatible endpoint for opt-in synthesis/extraction |
+| `LOREX_SYNTH_MODEL` | Model for opt-in `recall` answer synthesis |
 | `HYDRA_DB_API_KEY` | Only needed for `--cloud` mode |
-| `LOREX_LLM_BASE_URL` / `LOREX_LLM_API_KEY` | Opt-in LLM synthesis/extraction |
-| `LOREX_EXTRACT` | `llm` enables LLM fact extraction |
+| `HYDRADB_BASE_URL` / `HYDRADB_TIMEOUT_MS` | Cloud endpoint tuning |
+| `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `GROQ_API_KEY` | Benchmark judge |
+| `LOREX_EVAL_MODEL` | Judge model override |
+
+A `.env` file in the working directory is loaded for any variable not already
+set in the environment. See [.env.example](.env.example).
 
 ## Development
 
 ```bash
+npm test                  # everything: 7 suites + capabilities + verify
+npm run test:core         # domain + engine unit tests
+npm run test:sqlite       # SQLite integration (incl. 10k stress test)
+npm run test:engine       # engine flows on real SQLite
+npm run test:retrieval    # planner + evidence packing
+npm run test:ingestion    # normalizer/chunker/dedup/extractor
+npm run test:server       # live HTTP server + client
+npm run test:capabilities # 6 end-to-end capability checks
 npm run build
 npm run typecheck
-npm test            # core unit tests
-npm run test:capabilities   # 6 end-to-end capability checks
 ```
 
 ## License
