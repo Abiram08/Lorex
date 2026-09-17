@@ -10,3 +10,5 @@ lorex-graph.html
 verify-graph.html
 longmemeval-*results*.json
 *.progress.jsonl
+VISION.md
+docs/
