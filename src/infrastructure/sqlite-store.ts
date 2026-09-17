@@ -28,6 +28,7 @@ import type {
 import {
   memoryStrength,
   lifecycleScoreModifier,
+  TTL_DAYS,
   type ConsolidationCandidate,
   type ConsolidationResult,
 } from "./lifecycle.js";
@@ -107,18 +108,40 @@ const SCHEMA = `
 `;
 
 const INSERT_MEMORY = `
-  INSERT OR REPLACE INTO memories (
+  INSERT INTO memories (
     id, text, corpus, collection, fact_key, version_id,
     valid_from, valid_to, status, agent, reason, memory_type,
     trust, source_ref, metadata, relations, updated_at
   ) VALUES (?, ?, 'memory', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+  ON CONFLICT(id) DO UPDATE SET
+    text = excluded.text,
+    fact_key = excluded.fact_key,
+    version_id = excluded.version_id,
+    valid_from = excluded.valid_from,
+    valid_to = excluded.valid_to,
+    status = excluded.status,
+    agent = excluded.agent,
+    reason = excluded.reason,
+    memory_type = excluded.memory_type,
+    trust = excluded.trust,
+    source_ref = excluded.source_ref,
+    metadata = excluded.metadata,
+    relations = excluded.relations,
+    updated_at = datetime('now')
+    -- strength, access_count, last_accessed, created_at survive re-ingest
 `;
 
 const INSERT_KNOWLEDGE = `
-  INSERT OR REPLACE INTO memories (
+  INSERT INTO memories (
     id, text, corpus, collection, fact_key, version_id,
     valid_from, status, source_ref, metadata, updated_at
   ) VALUES (?, ?, 'knowledge', ?, ?, ?, datetime('now'), 'current', ?, ?, datetime('now'))
+  ON CONFLICT(id) DO UPDATE SET
+    text = excluded.text,
+    source_ref = excluded.source_ref,
+    metadata = excluded.metadata,
+    updated_at = datetime('now')
+    -- strength, access_count, last_accessed, created_at survive re-ingest
 `;
 
 const INSERT_RELATION = `INSERT INTO relations (from_id, to_id, type, reason) VALUES (?, ?, ?, ?)`;
@@ -171,6 +194,22 @@ function recencyBoost(validFrom: string | null): number {
   return Math.max(0, 1 - daysSince / 365) * 0.15;
 }
 
+/**
+ * TTL filter derived from lifecycle.TTL_DAYS (single source of truth).
+ * Types with null TTL persist; others must be younger than their TTL.
+ */
+function ttlCondition(): string {
+  const persistent = Object.entries(TTL_DAYS)
+    .filter(([, ttl]) => ttl === null)
+    .map(([type]) => `'${type}'`)
+    .join(",");
+  const expiring = Object.entries(TTL_DAYS)
+    .filter(([, ttl]) => ttl !== null)
+    .map(([type, ttl]) => `(m.memory_type = '${type}' AND datetime(m.created_at, '+${ttl} days') > datetime('now'))`)
+    .join(" OR ");
+  return `(m.memory_type IS NULL OR m.memory_type IN (${persistent})${expiring ? ` OR ${expiring}` : ""})`;
+}
+
 // ── Store ────────────────────────────────────────────────────────────────────
 
 export interface SqliteStoreOptions {
@@ -202,6 +241,32 @@ export class SqliteStore implements HydraDBLike {
     if (this.schemaReady) return;
     this.schemaReady = true;
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  /**
+   * Additive migrations for DBs created before newer columns existed.
+   * CREATE TABLE IF NOT EXISTS never alters, so each new column needs
+   * an explicit ALTER here. Idempotent: skips columns that exist.
+   */
+  private migrate(): void {
+    const existing = new Set(
+      (this.db.prepare(`PRAGMA table_info(memories)`).all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    const addColumn = (name: string, ddl: string) => {
+      if (!existing.has(name)) this.db.exec(`ALTER TABLE memories ADD COLUMN ${ddl}`);
+    };
+    addColumn("strength", `strength REAL DEFAULT 1.0`);
+    addColumn("access_count", `access_count INTEGER DEFAULT 0`);
+    addColumn("last_accessed", `last_accessed TEXT`);
+    addColumn("memory_type", `memory_type TEXT`);
+    addColumn("trust", `trust TEXT`);
+    addColumn("source_ref", `source_ref TEXT`);
+    addColumn("reason", `reason TEXT`);
+    addColumn("agent", `agent TEXT`);
+    // Rows inserted before the FTS table existed are invisible to MATCH.
+    // Rebuild is idempotent and cheap on small stores.
+    this.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`);
   }
 
   private prepared(sql: string): Database.Statement {
@@ -342,14 +407,8 @@ export class SqliteStore implements HydraDBLike {
       params.push(input.metadata_filters.as_of, input.metadata_filters.as_of);
     }
 
-    // TTL enforcement: filter expired memories by type
-    conditions.push(`(
-      m.memory_type IS NULL
-      OR m.memory_type IN ('fact', 'decision', 'preference', 'constraint', 'lesson')
-      OR (m.memory_type = 'task' AND datetime(m.created_at, '+30 days') > datetime('now'))
-      OR (m.memory_type = 'correction' AND datetime(m.created_at, '+180 days') > datetime('now'))
-      OR (m.memory_type = 'episode' AND datetime(m.created_at, '+30 days') > datetime('now'))
-    )`);
+    // TTL enforcement: filter expired memories by type (from lifecycle.TTL_DAYS)
+    conditions.push(ttlCondition());
 
     const where = `WHERE ${conditions.join(" AND ")}`;
     const limit = Math.min(maxResults * 3, 200);
@@ -473,7 +532,8 @@ export class SqliteStore implements HydraDBLike {
   getConsolidationCandidates(collection: string = "default"): ConsolidationCandidate[] {
     this.init();
     return this.db.prepare(
-      `SELECT id, fact_key, text, memory_type, created_at, strength, access_count
+      `SELECT id, fact_key AS factKey, text, memory_type AS memoryType,
+              created_at AS createdAt, strength, access_count AS accessCount
        FROM memories WHERE collection = ? AND status = 'current'`,
     ).all(collection) as ConsolidationCandidate[];
   }

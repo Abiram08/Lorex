@@ -235,4 +235,80 @@ assert.equal(degraded.unavailable, true, "and must say the backend was unavailab
   assert.equal(flagged.disputes === undefined || flagged.disputes.length >= 0, true);
 }
 
-console.log("✓ core tests passed");
+// ── Lifecycle tests ──────────────────────────────────────────────────────────
+
+import {
+  timeDecayStrength,
+  memoryStrength,
+  reinforcedStrength,
+  stalenessTag,
+  isExpired,
+  ttlRemaining,
+  planConsolidation,
+  HALF_LIFE_DAYS,
+  type ConsolidationCandidate,
+} from "../infrastructure/lifecycle.js";
+
+// Time-decay: recent memory has high strength
+const recentStrength = timeDecayStrength(new Date().toISOString());
+assert.ok(recentStrength > 0.9, `recent memory should be strong, got ${recentStrength}`);
+
+// Time-decay: old memory has low strength
+const oldDate = new Date(Date.now() - 180 * 86_400_000).toISOString();
+const oldStrength = timeDecayStrength(oldDate);
+assert.ok(oldStrength < 0.4, `180-day-old memory should be weak, got ${oldStrength}`);
+
+// Time-decay: half-life is correct
+const halfLifeDate = new Date(Date.now() - HALF_LIFE_DAYS * 86_400_000).toISOString();
+const halfStrength = timeDecayStrength(halfLifeDate);
+assert.ok(halfStrength > 0.45 && halfStrength < 0.55, `at half-life, strength should be ~0.5, got ${halfStrength}`);
+
+// Memory type lifecycle: episodes decay faster
+const episodeStrength = memoryStrength(new Date().toISOString(), "episode");
+const factStrength = memoryStrength(new Date().toISOString(), "fact");
+assert.ok(episodeStrength <= factStrength, "episodes should decay at least as fast as facts");
+
+// Memory type lifecycle: preferences strengthen with access
+const prefWeak = memoryStrength(oldDate, "preference", 0);
+const prefStrong = memoryStrength(oldDate, "preference", 5);
+assert.ok(prefStrong > prefWeak, "preferences should strengthen with access count");
+
+// Reinforcement boost
+const base = 0.3;
+const reinforced = reinforcedStrength(base);
+assert.ok(reinforced > base, "reinforcement should increase strength");
+assert.ok(reinforced <= 1.0, "reinforcement should not exceed max");
+
+// Staleness tags
+assert.equal(stalenessTag(new Date().toISOString()), "fresh");
+assert.equal(stalenessTag(new Date(Date.now() - 15 * 86_400_000).toISOString()), "recent");
+assert.equal(stalenessTag(new Date(Date.now() - 60 * 86_400_000).toISOString()), "aging");
+assert.equal(stalenessTag(new Date(Date.now() - 120 * 86_400_000).toISOString()), "stale");
+
+// TTL: episodes expire
+assert.equal(isExpired(new Date().toISOString(), "episode"), false);
+assert.equal(isExpired(new Date(Date.now() - 31 * 86_400_000).toISOString(), "episode"), true);
+
+// TTL: facts never expire
+assert.equal(isExpired(new Date(Date.now() - 365 * 86_400_000).toISOString(), "fact"), false);
+
+// TTL remaining
+const remaining = ttlRemaining(new Date(Date.now() - 10 * 86_400_000).toISOString(), "episode");
+assert.ok(remaining !== null && remaining > 15 && remaining < 25, `episode TTL should be ~20 days, got ${remaining}`);
+
+// Consolidation: prune weak and expire old memories
+const candidates: ConsolidationCandidate[] = [
+  { id: "1", factKey: "a", text: "strong", memoryType: "fact", createdAt: new Date().toISOString(), strength: 0.9, accessCount: 5 },
+  { id: "2", factKey: "b", text: "weak episode", memoryType: "episode", createdAt: new Date(Date.now() - 200 * 86_400_000).toISOString(), strength: 0.03, accessCount: 0 },
+  { id: "3", factKey: "c", text: "expired task", memoryType: "task", createdAt: new Date(Date.now() - 40 * 86_400_000).toISOString(), strength: 0.5, accessCount: 0 },
+  { id: "4", factKey: "d", text: "weak fact", memoryType: "fact", createdAt: new Date().toISOString(), strength: 0.02, accessCount: 0 },
+];
+const plan = planConsolidation(candidates);
+// 200-day-old episode: expired (TTL=30d), not just pruned
+assert.ok(plan.expired.includes("2"), "expired episode should be in expired list");
+// 40-day task: expired (TTL=30d)
+assert.ok(plan.expired.includes("3"), "expired task should be in expired list");
+// Very weak fact: pruned (below threshold)
+assert.ok(plan.pruned.includes("4"), "very weak fact should be pruned");
+
+console.log("✓ lifecycle tests passed");

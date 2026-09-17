@@ -1,7 +1,7 @@
 {
   "name": "@lorex/cli",
   "version": "0.3.0",
-  "description": "Agent memory and context layer on HydraDB: temporal, graph-connected, evidence-backed project memory that abstains when the history does not support an answer.",
+  "description": "Local-first memory for coding agents: temporal, causal, evidence-backed project memory with lifecycle, consolidation, and dream. SQLite by default.",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -18,8 +18,9 @@
     "init": "node dist/index.js init",
     "doctor": "node dist/index.js doctor",
     "dashboard": "node dist/index.js dashboard",
-    "test": "npm run test:core && npm run test:capabilities && npm run test:infra && npm run verify",
+    "test": "npm run test:core && npm run test:sqlite && npm run test:capabilities && npm run test:infra && npm run verify",
     "test:core": "tsx src/tests/core.ts",
+    "test:sqlite": "tsx src/tests/sqlite.ts",
     "test:capabilities": "tsx src/tests/requirements.ts",
     "test:infra": "tsx src/tests/infrastructure.ts",
     "demo": "tsx src/demo-crossagent.ts",
