@@ -1,8 +1,6 @@
 /**
- * Session capture: reads agent transcript JSONL files, extracts turns,
- * and ingests them into Lorex memory.
- *
- * Supports Claude Code transcripts. Other agents can add parsers here.
+ * Session capture: read agent transcript JSONL files, extract turns,
+ * ingest into Lorex memory. Claude Code supported; other agents add parsers here.
  */
 
 import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
@@ -10,8 +8,6 @@ import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import type { LorexEngine } from "../engine.js";
 import { normalizeSession } from "./normalizer.js";
-
-// ── Types ────────────────────────────────────────────────────────────────────
 
 export interface CaptureOpts {
   transcriptPath: string;
@@ -36,9 +32,6 @@ interface Turn {
   timestamp?: string;
 }
 
-// ── Transcript parsing ───────────────────────────────────────────────────────
-
-/** Extract text from a Claude Code message entry (string or content array). */
 function extractText(entry: Record<string, unknown>): string {
   const msg = entry.message;
   if (typeof msg === "string") return msg;
@@ -47,7 +40,6 @@ function extractText(entry: Record<string, unknown>): string {
   return "";
 }
 
-/** Role mapping: Claude Code uses "human"/"assistant", some use "user"/"ai". */
 const ROLE_MAP: Record<string, Turn["role"]> = {
   human: "user", user: "user",
   assistant: "assistant", ai: "assistant",
@@ -68,9 +60,6 @@ function parseTranscript(raw: string): Turn[] {
   });
 }
 
-// ── Capture ──────────────────────────────────────────────────────────────────
-
-/** Ingest a transcript file into Lorex memory. */
 export async function captureTranscript(engine: LorexEngine, opts: CaptureOpts): Promise<CaptureResult> {
   const empty = (sessionId: string, error: string): CaptureResult => ({
     sessionId, chunkCount: 0, factCount: 0, tokenCount: 0, duplicateCount: 0, errors: [error], partial: false,
@@ -102,7 +91,6 @@ export async function captureTranscript(engine: LorexEngine, opts: CaptureOpts):
   };
 }
 
-/** Find the most recent Claude Code transcript in ~/.claude/projects/. */
 export async function autoCaptureClaudeSession(engine: LorexEngine): Promise<CaptureResult | null> {
   const claudeDir = join(homedir(), ".claude", "projects");
   if (!existsSync(claudeDir)) return null;

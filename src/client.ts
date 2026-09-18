@@ -1,17 +1,12 @@
-/**
- * Tiny HTTP client for a `lorex local` server.
- * Zero external deps, Supermemory-style API surface.
+/** Tiny HTTP client for a `lorex local` server. Zero deps.
  *
  * ```ts
  * import { Lorex } from "@lorex/cli/dist/client.js";
  * const lorex = new Lorex();
  * await lorex.add("Session storage moved to Redis because Atlas timed out");
  * const r = await lorex.search("what do we use for sessions?");
- * console.log(r.answer ?? r.summary);
  * ```
  */
-
-// ── Types ────────────────────────────────────────────────────────────────────
 
 export interface AddResult {
   ok: boolean;
@@ -32,16 +27,12 @@ export interface HealthResult {
   agent?: string;
 }
 
-// ── Errors ───────────────────────────────────────────────────────────────────
-
 export class LorexError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message);
     this.name = "LorexError";
   }
 }
-
-// ── Client ───────────────────────────────────────────────────────────────────
 
 export class Lorex {
   constructor(private readonly baseUrl = "http://127.0.0.1:3777") {}
@@ -59,22 +50,18 @@ export class Lorex {
     return JSON.parse(text) as T;
   }
 
-  /** Store a fact. Include the reason in text ("... because ...") or pass it explicitly. */
   async add(text: string, opts: { id?: string; because?: string } = {}): Promise<AddResult> {
     return this.request<AddResult>("POST", "/add", { text, ...opts });
   }
 
-  /** Recall. Check `abstained` before trusting the answer. */
   async search(query: string, opts: { asOf?: string } = {}): Promise<SearchResult> {
     return this.request<SearchResult>("POST", "/search", { query, ...opts });
   }
 
-  /** Session-start pack: latest handoff + contributing agents + summary. */
   async resume(): Promise<SearchResult> {
     return this.request<SearchResult>("GET", "/resume");
   }
 
-  /** Health check. */
   async health(): Promise<HealthResult> {
     return this.request<HealthResult>("GET", "/health");
   }

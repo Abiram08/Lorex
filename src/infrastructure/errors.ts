@@ -1,9 +1,4 @@
-/**
- * Domain error types for Lorex.
- *
- * Using typed errors instead of string messages makes catch blocks
- * more precise and diagnostics clearer.
- */
+/** Domain errors. Typed codes beat string matching in catch blocks. */
 
 export class LorexError extends Error {
   constructor(

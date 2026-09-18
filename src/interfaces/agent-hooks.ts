@@ -12,8 +12,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
 function readJson(path: string): Record<string, unknown> {
   try {
     if (!existsSync(path)) return {};
@@ -49,11 +47,17 @@ function ensureHook(
 
 // ── Claude Code ──────────────────────────────────────────────────────────────
 
-function installClaudeCode(cwd: string): string {
-  const settingsPath = join(cwd, ".claude", "settings.json");
-  mkdirSync(join(cwd, ".claude"), { recursive: true });
-  const settings = readJson(settingsPath);
+function loadHookSettings(cwd: string, dir: string, file: string): { path: string; hooks: Record<string, Array<Record<string, unknown>>>; save: () => void } {
+  const dirPath = join(cwd, dir);
+  mkdirSync(dirPath, { recursive: true });
+  const path = join(dirPath, file);
+  const settings = readJson(path);
   const hooks = (settings.hooks ?? {}) as Record<string, Array<Record<string, unknown>>>;
+  return { path, hooks, save: () => { settings.hooks = hooks; writeJson(path, settings); } };
+}
+
+function installClaudeCode(cwd: string): string {
+  const { path, hooks, save } = loadHookSettings(cwd, ".claude", "settings.json");
 
   ensureHook(hooks, "SessionStart", "startup", "lorex resume --plain");
   ensureHook(hooks, "SessionStart", "compact", "lorex resume --plain");
@@ -67,25 +71,20 @@ function installClaudeCode(cwd: string): string {
   }
   hooks.Stop = stopList;
 
-  settings.hooks = hooks;
-  writeJson(settingsPath, settings);
-  return settingsPath;
+  save();
+  return path;
 }
 
 // ── Cursor ───────────────────────────────────────────────────────────────────
 
 function installCursor(cwd: string): string {
-  const settingsPath = join(cwd, ".cursor", "settings.json");
-  mkdirSync(join(cwd, ".cursor"), { recursive: true });
-  const settings = readJson(settingsPath);
-  const hooks = (settings.hooks ?? {}) as Record<string, Array<Record<string, unknown>>>;
+  const { path, hooks, save } = loadHookSettings(cwd, ".cursor", "settings.json");
 
   ensureHook(hooks, "SessionStart", undefined, "lorex resume --plain");
   ensureHook(hooks, "Stop", undefined, "lorex resume --plain");
 
-  settings.hooks = hooks;
-  writeJson(settingsPath, settings);
-  return settingsPath;
+  save();
+  return path;
 }
 
 // ── Windsurf ─────────────────────────────────────────────────────────────────
@@ -123,8 +122,6 @@ function installCodex(cwd: string): string {
   writeFileSync(instructionsPath, block);
   return instructionsPath;
 }
-
-// ── Public API ───────────────────────────────────────────────────────────────
 
 export type AgentKind = "claude-code" | "cursor" | "windsurf" | "codex";
 

@@ -15,14 +15,10 @@ import { randomBytes } from "node:crypto";
 import type { LorexEngine } from "../engine.js";
 import { LIMITS } from "../infrastructure/limits.js";
 
-// ── Types ────────────────────────────────────────────────────────────────────
-
 export interface LocalServerOptions {
   host?: string;
   port?: number;
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function requestId(): string {
   return randomBytes(8).toString("hex");
@@ -50,8 +46,6 @@ function json(res: ServerResponse, status: number, body: unknown): void {
 async function parseJsonBody<T>(req: IncomingMessage): Promise<T | null> {
   try { return JSON.parse(await readBody(req)) as T; } catch { return null; }
 }
-
-// ── Server ───────────────────────────────────────────────────────────────────
 
 export async function serveLocal(
   engine: LorexEngine,
@@ -120,5 +114,6 @@ export async function serveLocal(
   });
 
   await new Promise<void>((resolve) => server.listen(port, host, resolve));
-  return { url: `http://${host}:${port}`, stop: () => server.close() };
+  const actualPort = (server.address() as { port?: number } | null)?.port ?? port;
+  return { url: `http://${host}:${actualPort}`, stop: () => server.close() };
 }
