@@ -112,3 +112,41 @@ function ev(role: "user" | "assistant", content: string, n = 0): ConversationEve
 }
 
 console.log("✓ ingestion tests passed");
+
+// ── Multi-format transcript parsing ──────────────────────────────────────────
+
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MockHydraDB } from "../infrastructure/mock-hydradb.js";
+import { LorexEngine } from "../engine.js";
+import { resolveIdentity } from "../infrastructure/identity.js";
+import { captureTranscript } from "../ingestion/session-capture.js";
+
+{
+  const dir = mkdtempSync(join(tmpdir(), "lorex-parse-test-"));
+  const engine = new LorexEngine(new MockHydraDB(), resolveIdentity(dir, { collection: "parse" }), 1000);
+
+  const openai = join(dir, "openai.jsonl");
+  writeFileSync(openai, [
+    JSON.stringify({ role: "user", content: "We decided to use Redis for sessions." }),
+    JSON.stringify({ role: "assistant", content: "Recorded." }),
+  ].join("\n"));
+  const r1 = await captureTranscript(engine, { transcriptPath: openai });
+  assert.ok(r1.chunkCount >= 1, `openai format parsed, got ${r1.chunkCount} chunks`);
+
+  const pairs = join(dir, "pairs.jsonl");
+  writeFileSync(pairs, JSON.stringify({ prompt: "We migrated to Postgres for analytics.", response: "Noted." }));
+  const r2 = await captureTranscript(engine, { transcriptPath: pairs });
+  assert.ok(r2.chunkCount >= 1, "prompt/response format parsed");
+
+  const junk = join(dir, "junk.jsonl");
+  writeFileSync(junk, [JSON.stringify({ foo: "bar" }), "not json at all", JSON.stringify({ type: "unknown_event" })].join("\n"));
+  const r3 = await captureTranscript(engine, { transcriptPath: junk });
+  assert.ok(r3.errors.length > 0, "empty transcript reports an error, doesn't throw");
+
+  const r4 = await captureTranscript(engine, { transcriptPath: join(dir, "nope.jsonl") });
+  assert.ok(r4.errors.length > 0, "missing file reports an error");
+}
+
+console.log("✓ transcript parser tests passed");

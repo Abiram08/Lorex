@@ -22,6 +22,7 @@ const RememberSchema = z.object({
   ttlSeconds: z.number().int().positive().max(365 * 24 * 3600).optional(),
   because: z.string().max(1000).optional(),
   agent: z.string().max(64).optional(),
+  scope: z.enum(["global", "project"]).optional(),
 });
 
 const LearnSchema = z.object({
@@ -62,6 +63,7 @@ const ReportSchema = z.object({
   rating: z.enum(["positive", "negative", "neutral"]).optional(),
   feedback: z.string().max(2000).optional(),
   sourceIds: z.array(z.string()).max(50).optional(),
+  query: z.string().max(LIMITS.maxQueryChars).optional(),
 });
 
 const WhySchema = z.object({
@@ -148,6 +150,7 @@ export function createServer(engine: LorexEngine): Server {
             ttlSeconds: { type: "number" },
             because: { type: "string", description: "Why this replaces the previous value" },
             agent: { type: "string" },
+            scope: { type: "string", enum: ["global", "project"], description: "global = user-level, visible from every project" },
           },
           required: ["fact"],
           additionalProperties: false,
@@ -277,10 +280,32 @@ export function createServer(engine: LorexEngine): Server {
             rating: { type: "string", enum: ["positive", "negative", "neutral"] },
             feedback: { type: "string" },
             sourceIds: { type: "array", items: { type: "string" } },
+            query: { type: "string", description: "The query that produced this result (enables recall-gap learning)" },
           },
           required: ["requestId"],
           additionalProperties: false,
         },
+      },
+      {
+        name: "dream",
+        description:
+          "Mine sessions for repeated patterns, recurring topics, and contradictions; persist discoveries as memories.",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      },
+      {
+        name: "consolidate",
+        description:
+          "Apply expired TTLs and resolve correction chains. Pass prune:true to also merge duplicates and prune weak memories.",
+        inputSchema: {
+          type: "object",
+          properties: { prune: { type: "boolean" } },
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "open_loops",
+        description: "Tasks recorded but never acted on (unfinished work).",
+        inputSchema: { type: "object", properties: {}, additionalProperties: false },
       },
     ],
   }));
@@ -364,6 +389,46 @@ export function createServer(engine: LorexEngine): Server {
           const parsed = ForgetSchema.safeParse(args);
           if (!parsed.success) return badArgs(parsed.error.message);
           receipt = await engine.forget(parsed.data);
+          break;
+        }
+        case "dream": {
+          const r = await engine.dream();
+          receipt = {
+            op: "ingest" as const,
+            sources: [],
+            mode_used: "fast" as const,
+            token_cost: 0,
+            abstained: false,
+            summary: `Dream found ${r.discovered.length} patterns, persisted ${r.persisted}, reinforced ${r.reinforced.length}.`,
+            result: r,
+          };
+          break;
+        }
+        case "consolidate": {
+          const prune = args.prune === true;
+          const r = await engine.consolidate(prune);
+          receipt = {
+            op: "ingest" as const,
+            sources: [],
+            mode_used: "fast" as const,
+            token_cost: 0,
+            abstained: false,
+            summary: `Consolidation: ${r.expired} expired, ${r.pruned} pruned, ${r.merged} merged.`,
+            result: r,
+          };
+          break;
+        }
+        case "open_loops": {
+          const loops = await engine.openLoops();
+          receipt = {
+            op: "list" as const,
+            sources: [],
+            mode_used: "fast" as const,
+            token_cost: 0,
+            abstained: false,
+            summary: loops.length ? `${loops.length} open loops.` : "No open loops.",
+            result: loops,
+          };
           break;
         }
         case "capture_session": {

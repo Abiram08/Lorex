@@ -783,6 +783,56 @@ export class SqliteStore implements HydraDBLike {
     return losers.length;
   }
 
+  /** Export all rows for backup or cross-machine sync (JSONL-friendly). */
+  exportRows(collection?: string): Array<Record<string, unknown>> {
+    this.init();
+    const memories = (collection
+      ? this.db.prepare(`SELECT * FROM memories WHERE collection = ?`).all(collection)
+      : this.db.prepare(`SELECT * FROM memories`).all()) as Array<Record<string, unknown>>;
+    const relations = this.db.prepare(`SELECT from_id, to_id, type, reason FROM relations`).all() as Array<Record<string, unknown>>;
+    return [
+      ...memories.map((m) => ({ kind: "memory", ...m })),
+      ...relations.map((r) => ({ kind: "relation", ...r })),
+    ];
+  }
+
+  /**
+   * Import rows from exportRows. Local wins by default: existing ids are
+   * skipped unless overwrite is set. Returns { imported, skipped }.
+   */
+  importRows(rows: Array<Record<string, unknown>>, overwrite = false): { imported: number; skipped: number } {
+    this.init();
+    let imported = 0;
+    let skipped = 0;
+
+    this.db.transaction(() => {
+      for (const row of rows) {
+        if (row.kind === "relation") {
+          const exists = this.db.prepare(`SELECT 1 FROM relations WHERE from_id = ? AND to_id = ? AND type = ?`)
+            .get(row.from_id, row.to_id, row.type);
+          if (exists) { skipped++; continue; }
+          this.prepared(INSERT_RELATION).run(row.from_id, row.to_id, row.type, row.reason ?? null);
+          imported++;
+          continue;
+        }
+        if (row.kind !== "memory" || typeof row.id !== "string") { skipped++; continue; }
+        const exists = this.prepared(`SELECT 1 FROM memories WHERE id = ?`).get(row.id);
+        if (exists && !overwrite) { skipped++; continue; }
+        const cols = ["id", "text", "corpus", "collection", "fact_key", "version_id", "valid_from", "valid_to", "status", "agent", "reason", "memory_type", "trust", "source_ref", "strength", "access_count", "last_accessed", "metadata", "relations", "created_at", "updated_at"];
+        const vals = cols.map((c) => (row[c] as unknown) ?? null);
+        this.prepared(
+          overwrite
+            ? `INSERT OR REPLACE INTO memories (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`
+            : `INSERT OR IGNORE INTO memories (${cols.join(",")}) VALUES (${cols.map(() => "?").join(",")})`,
+        ).run(...vals);
+        imported++;
+      }
+      this.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`);
+    })();
+
+    return { imported, skipped };
+  }
+
   close(): void {
     this.stmts.clear();
     this.db.close();

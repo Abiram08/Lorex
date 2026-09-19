@@ -679,10 +679,13 @@ async function remember(
   await store.ingestMemory({
     database: "d", collection: "merge",
     memories: [
-      { id: "m_strong", text: "The deploy pipeline uses GitHub Actions with staging gates and prod approval", additional_metadata: { fact_key: "deploy", strength: 0.9 } },
-      { id: "m_weak", text: "The deploy pipeline uses GitHub Actions", additional_metadata: { fact_key: "deploy", strength: 0.4 } },
+      { id: "m_strong", text: "The deploy pipeline uses GitHub Actions with staging gates and prod approval", additional_metadata: { fact_key: "deploy" } },
+      { id: "m_weak", text: "The deploy pipeline uses GitHub Actions", additional_metadata: { fact_key: "deploy" } },
     ],
   });
+  const mdb = (store as unknown as { db: import("better-sqlite3").Database }).db;
+  mdb.prepare(`UPDATE memories SET created_at = '2020-01-01 00:00:00', strength = 0.4 WHERE id = 'm_weak'`).run();
+  mdb.prepare(`UPDATE memories SET strength = 0.9 WHERE id = 'm_strong'`).run();
 
   const cands = store.getConsolidationCandidates("merge");
   const plan = planConsolidation(cands);

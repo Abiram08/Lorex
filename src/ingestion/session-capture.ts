@@ -45,15 +45,43 @@ const ROLE_MAP: Record<string, Turn["role"]> = {
   assistant: "assistant", ai: "assistant",
 };
 
+/** Tolerant turn extraction: Claude ({type,message}), OpenAI ({role,content}),
+ *  Codex session items, and {prompt,response} pairs. Unknown shapes are skipped. */
+function entryToTurns(entry: Record<string, unknown>): Turn[] {
+  const ts = typeof entry.timestamp === "string" ? entry.timestamp : undefined;
+
+  const claudeRole = ROLE_MAP[String(entry.type)];
+  if (claudeRole) {
+    const text = extractText(entry).trim();
+    return text ? [{ role: claudeRole, content: text, timestamp: ts }] : [];
+  }
+
+  const role = ROLE_MAP[String(entry.role)];
+  if (role) {
+    const content = entry.content;
+    const text = typeof content === "string" ? content
+      : Array.isArray(content) ? content.map((m: Record<string, unknown>) => m.text ?? "").join("") : "";
+    return text.trim() ? [{ role, content: text.trim(), timestamp: ts }] : [];
+  }
+
+  if (entry.type === "response_item" && entry.payload && typeof entry.payload === "object") {
+    return entryToTurns({ ...(entry.payload as Record<string, unknown>), timestamp: ts });
+  }
+
+  const out: Turn[] = [];
+  if (typeof entry.prompt === "string" && entry.prompt.trim()) {
+    out.push({ role: "user", content: entry.prompt.trim(), timestamp: ts });
+  }
+  if (typeof entry.response === "string" && entry.response.trim()) {
+    out.push({ role: "assistant", content: entry.response.trim(), timestamp: ts });
+  }
+  return out;
+}
+
 function parseTranscript(raw: string): Turn[] {
   return raw.split("\n").filter((l) => l.trim()).flatMap((line): Turn[] => {
     try {
-      const entry = JSON.parse(line) as Record<string, unknown>;
-      const role = ROLE_MAP[String(entry.type)];
-      if (!role) return [];
-      const text = extractText(entry).trim();
-      if (!text) return [];
-      return [{ role, content: text, timestamp: typeof entry.timestamp === "string" ? entry.timestamp : undefined }];
+      return entryToTurns(JSON.parse(line) as Record<string, unknown>);
     } catch {
       return [];
     }
@@ -91,24 +119,50 @@ export async function captureTranscript(engine: LorexEngine, opts: CaptureOpts):
   };
 }
 
-export async function autoCaptureClaudeSession(engine: LorexEngine): Promise<CaptureResult | null> {
-  const claudeDir = join(homedir(), ".claude", "projects");
-  if (!existsSync(claudeDir)) return null;
+const SESSION_DIRS: Array<{ dir: string; agent: string }> = [
+  { dir: join(homedir(), ".claude", "projects"), agent: "claude-code" },
+  { dir: join(homedir(), ".codex", "sessions"), agent: "codex" },
+];
 
+function newestJsonl(dir: string): string | null {
   let newest: string | null = null;
   let newestTime = 0;
-
-  try {
-    for (const project of readdirSync(claudeDir)) {
-      const dir = join(claudeDir, project);
-      if (!statSync(dir).isDirectory()) continue;
-      for (const file of readdirSync(dir)) {
-        if (!file.endsWith(".jsonl")) continue;
-        const mtime = statSync(join(dir, file)).mtimeMs;
-        if (mtime > newestTime) { newestTime = mtime; newest = join(dir, file); }
-      }
+  const walk = (d: string, depth: number): void => {
+    if (depth > 3) return;
+    let entries: string[];
+    try {
+      entries = readdirSync(d);
+    } catch { return; }
+    for (const file of entries) {
+      const full = join(d, file);
+      let stat;
+      try {
+        stat = statSync(full);
+      } catch { continue; }
+      if (stat.isDirectory()) { walk(full, depth + 1); continue; }
+      if (!file.endsWith(".jsonl")) continue;
+      if (stat.mtimeMs > newestTime) { newestTime = stat.mtimeMs; newest = full; }
     }
-  } catch { return null; }
+  };
+  walk(dir, 0);
+  return newest;
+}
 
-  return newest ? captureTranscript(engine, { transcriptPath: newest, agent: "claude-code" }) : null;
+export async function autoCaptureSession(engine: LorexEngine): Promise<CaptureResult | null> {
+  let best: { path: string; agent: string; mtime: number } | null = null;
+  for (const { dir, agent } of SESSION_DIRS) {
+    if (!existsSync(dir)) continue;
+    const found = newestJsonl(dir);
+    if (!found) continue;
+    let mtime = 0;
+    try {
+      mtime = statSync(found).mtimeMs;
+    } catch { continue; }
+    if (!best || mtime > best.mtime) best = { path: found, agent, mtime };
+  }
+  return best ? captureTranscript(engine, { transcriptPath: best.path, agent: best.agent }) : null;
+}
+
+export async function autoCaptureClaudeSession(engine: LorexEngine): Promise<CaptureResult | null> {
+  return autoCaptureSession(engine);
 }

@@ -446,6 +446,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         sourceRef: flag("--sourceRef"),
         ttlSeconds: flag("--ttl") ? Number(flag("--ttl")) : undefined,
         because: flag("--because"),
+        scope: flag("--scope") === "global" ? "global" : undefined,
       });
       break;
     }
@@ -603,6 +604,69 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
       });
       break;
     }
+    case "dream": {
+      const r = await engine.dream();
+      println(JSON.stringify({
+        op: "dream",
+        discovered: r.discovered.length,
+        persisted: r.persisted,
+        reinforced: r.reinforced.length,
+        contradictions: r.contradictions.length,
+        consolidated: r.consolidated,
+        durationMs: r.durationMs,
+        summary: `Dream found ${r.discovered.length} patterns, persisted ${r.persisted}, ` +
+          `reinforced ${r.reinforced.length}, flagged ${r.contradictions.length} contradictions.`,
+        result: r,
+      }, null, 2));
+      return;
+    }
+    case "consolidate": {
+      const r = await engine.consolidate(args.includes("--prune"));
+      println(JSON.stringify({
+        op: "consolidate",
+        ...r,
+        summary: `Consolidation: ${r.expired} expired applied` +
+          (args.includes("--prune") ? `, ${r.pruned} pruned, ${r.merged} merged` : `, ${r.planned - r.expired} more pending (pass --prune to apply)`),
+      }, null, 2));
+      return;
+    }
+    case "open-loops": {
+      const loops = await engine.openLoops();
+      if (!loops.length) {
+        println("No open loops — nothing unfinished.");
+        return;
+      }
+      for (const l of loops) println(`- [${l.age_days}d] ${l.text} (${l.id})`);
+      return;
+    }
+    case "export": {
+      const rows = await engine.exportData(flag("--collection"));
+      if (!rows) {
+        return println(JSON.stringify({ error: "export requires the local SQLite backend" }));
+      }
+      const lines = rows.map((r) => JSON.stringify(r)).join("\n") + "\n";
+      const out = flag("--out");
+      if (out) {
+        const { writeFileSync } = await import("node:fs");
+        writeFileSync(out, lines);
+        println(JSON.stringify({ op: "export", rows: rows.length, out }));
+      } else {
+        process.stdout.write(lines);
+      }
+      return;
+    }
+    case "import": {
+      const file = flag("--file") ?? flag("--in");
+      if (!file) return println(JSON.stringify({ error: "--file required" }));
+      const { readFileSync } = await import("node:fs");
+      const rows = readFileSync(file, "utf8").split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l) as Record<string, unknown>);
+      const r = await engine.importData(rows, args.includes("--force"));
+      if (!r) {
+        return println(JSON.stringify({ error: "import requires the local SQLite backend" }));
+      }
+      println(JSON.stringify({ op: "import", ...r, summary: `Imported ${r.imported}, skipped ${r.skipped} existing.` }));
+      return;
+    }
     case "forget": {
       receipt = await engine.forget({
         factId: flag("--factId"),
@@ -617,11 +681,14 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         requestId,
         answer: flag("--answer"),
         rating: flag("--rating") as "positive" | "negative" | "neutral" | undefined,
+        feedback: flag("--feedback"),
+        query: flag("--query"),
+        sourceIds: flag("--sourceIds")?.split(",").map((s) => s.trim()).filter(Boolean),
       });
       break;
     }
     case "capture": {
-      const { captureTranscript, autoCaptureClaudeSession } = await import("../ingestion/session-capture.js");
+      const { captureTranscript, autoCaptureSession } = await import("../ingestion/session-capture.js");
       const transcriptPath = flag("--transcript") ?? flag("--file");
 
       if (transcriptPath) {
@@ -642,8 +709,8 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
           result: receipt,
         };
       } else {
-        // Auto-detect most recent Claude session
-        const result = await autoCaptureClaudeSession(engine);
+        // Auto-detect most recent session across known agent dirs
+        const result = await autoCaptureSession(engine);
         if (!result) {
           receipt = {
             op: "capture",
@@ -651,7 +718,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
             mode_used: "fast",
             token_cost: 0,
             abstained: true,
-            summary: "No recent Claude Code session found.",
+            summary: "No recent agent session found (checked Claude Code, Codex).",
           };
         } else {
           receipt = {
@@ -738,6 +805,11 @@ export async function runCli(argv: string[]): Promise<void> {
     case "graph": return cmdOneShot("graph", rest);
     case "why": return cmdOneShot("why", rest);
     case "handoff": return cmdOneShot("handoff", rest);
+    case "dream": return cmdOneShot("dream", rest);
+    case "consolidate": return cmdOneShot("consolidate", rest);
+    case "open-loops": return cmdOneShot("open-loops", rest);
+    case "export": return cmdOneShot("export", rest);
+    case "import": return cmdOneShot("import", rest);
     case "help":
     case "--help":
     case "-h":
@@ -771,7 +843,7 @@ Simple (human output):
   lorex ask "what do we use for sessions?"
 
 Full (JSON):
-  lorex remember --fact "..." [--id id] [--because "..."] [--validFrom ISO] [--ttl s]
+  lorex remember --fact "..." [--id id] [--because "..."] [--validFrom ISO] [--ttl s] [--scope global]
   lorex recall [--query "..."] [--asOf ISO] [--mode fast|thinking] [--synthesize]
   lorex why [--factId id] [--query "..."]      Why a decision changed
   lorex graph [--query "..."] [--out f.html]   Render the context graph
@@ -784,6 +856,11 @@ Full (JSON):
   lorex resume
   lorex forget [--factId id] [--query "..."]
   lorex report --requestId id [--answer "..."] [--rating positive|negative|neutral]
+  lorex dream                               Mine sessions for patterns, persist discoveries
+  lorex consolidate [--prune]               Apply expired TTLs (and, with --prune, merges)
+  lorex open-loops                          Tasks recorded but never acted on
+  lorex export [--collection c] [--out f]   Dump memories as JSONL (backup, git, sync)
+  lorex import --file f [--force]           Merge a dump (local wins unless --force)
   lorex capture --sessionId id --file turns.json [--startedAt ISO]
 
 All commands run local-first (no key needed). Add --cloud to use HydraDB sync when configured.

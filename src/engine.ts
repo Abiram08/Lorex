@@ -1130,6 +1130,20 @@ export class LorexEngine {
     return store ? store.getOpenLoops(this.identity.collection) : [];
   }
 
+  /** Dump rows for backup or cross-machine sync. Null when backend can't export. */
+  async exportData(collection?: string): Promise<Array<Record<string, unknown>> | null> {
+    await this.ensureReady();
+    const store = this.lifecycleStore;
+    return store ? store.exportRows(collection ?? this.identity.collection) : null;
+  }
+
+  /** Merge a dump. Local rows win unless overwrite is set. */
+  async importData(rows: Array<Record<string, unknown>>, overwrite = false): Promise<{ imported: number; skipped: number } | null> {
+    await this.ensureReady();
+    const store = this.lifecycleStore;
+    return store ? store.importRows(rows, overwrite) : null;
+  }
+
   async report(input: {
     requestId: string;
     answer?: string;

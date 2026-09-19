@@ -185,4 +185,48 @@ function freshEngine(collection = "eng"): { engine: LorexEngine; done: () => voi
   done();
 }
 
+// ── export/import round-trip ─────────────────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("sync_a");
+  await engine.remember("Sync probe decision about caching", { id: "sync_probe" });
+  await engine.handoff({ decision: "Sync probe done", nextStep: "Verify on machine B" });
+
+  const rows = await engine.exportData();
+  assert.ok(rows && rows.length >= 2, `export dumps rows, got ${rows?.length}`);
+
+  const { engine: engineB, done: doneB } = freshEngine("sync_a");
+  const r = await engineB.importData(rows ?? [], false);
+  assert.ok(r && r.imported >= 2, `import merges rows, got ${JSON.stringify(r)}`);
+
+  const q = await engineB.recall({ query: "sync probe caching" });
+  assert.ok(
+    q.sources.some((s) => (s.content ?? s.excerpt ?? "").includes("Sync probe")),
+    "imported memory is recallable on the other engine",
+  );
+
+  const again = await engineB.importData(rows ?? [], false);
+  assert.equal(again?.imported, 0, "re-import skips existing rows (local wins)");
+  done();
+  doneB();
+}
+
+// ── dream/consolidate/openLoops via engine ────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("maint");
+  for (let i = 0; i < 3; i++) {
+    await engine.remember(`Maintenance note repetition ${i} about log rotation`, { id: `maint_${i}` });
+  }
+  const d = await engine.dream();
+  assert.ok(d.persisted >= 0 && d.durationMs >= 0, "dream runs end to end");
+
+  const c = await engine.consolidate();
+  assert.ok(c.planned >= 0 && c.expired >= 0, "consolidate returns counts");
+
+  const loops = await engine.openLoops();
+  assert.ok(Array.isArray(loops), "openLoops returns an array");
+  done();
+}
+
 console.log("✓ engine sqlite flows passed");

@@ -61,8 +61,8 @@ function installClaudeCode(cwd: string): string {
 
   ensureHook(hooks, "SessionStart", "startup", "lorex resume --plain");
   ensureHook(hooks, "SessionStart", "compact", "lorex resume --plain");
-  ensureHook(hooks, "PreCompact", undefined, "lorex resume --plain");
   ensureHook(hooks, "Stop", undefined, "lorex resume --plain");
+  ensureHook(hooks, "PreCompact", undefined, "lorex capture --auto 2>/dev/null || true");
 
   // Auto-capture on stop
   const stopList = hooks.Stop ?? [];
@@ -81,7 +81,7 @@ function installCursor(cwd: string): string {
   const { path, hooks, save } = loadHookSettings(cwd, ".cursor", "settings.json");
 
   ensureHook(hooks, "SessionStart", undefined, "lorex resume --plain");
-  ensureHook(hooks, "Stop", undefined, "lorex resume --plain");
+  ensureHook(hooks, "Stop", undefined, "lorex capture --auto 2>/dev/null || true");
 
   save();
   return path;
@@ -98,7 +98,8 @@ function installWindsurf(cwd: string): string {
     existing,
     "\n# Lorex Memory",
     "At session start, run `lorex resume --plain` to load project memory.",
-    "At session end, run `lorex capture --auto` to save decisions.\n",
+    "At session end, run `lorex capture --auto` to save decisions.",
+    "Before compacting context or clearing the session, run `lorex capture --auto` so decisions survive the wipe.\n",
   ].filter(Boolean).join("\n");
 
   writeFileSync(rulesPath, block);
@@ -116,7 +117,8 @@ function installCodex(cwd: string): string {
     existing,
     "\n## Lorex Memory",
     "Before starting work, run `lorex resume --plain` to load project memory.",
-    "At session end, run `lorex capture --auto` to save decisions.\n",
+    "At session end, run `lorex capture --auto` to save decisions.",
+    "Before compacting context or clearing the session, run `lorex capture --auto` so decisions survive the wipe.\n",
   ].filter(Boolean).join("\n");
 
   writeFileSync(instructionsPath, block);
@@ -135,7 +137,7 @@ const INSTALLERS: Record<AgentKind, (cwd: string) => string> = {
 export function installHooks(agent: AgentKind, cwd: string): { path: string; description: string } {
   const path = INSTALLERS[agent](cwd);
   const descriptions: Record<AgentKind, string> = {
-    "claude-code": "SessionStart → memory loads every session\n  PreCompact → memory re-injected after compaction\n  Stop → session auto-captured",
+    "claude-code": "SessionStart → memory loads every session\n  PreCompact → session captured before compaction wipe\n  Stop → session auto-captured",
     cursor: "SessionStart → memory loads every session\n  Stop → session auto-captured",
     windsurf: "Memory context added to .windsurfrules",
     codex: "Memory instructions added to CODEX.md",
