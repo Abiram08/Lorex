@@ -3,6 +3,9 @@
 process.env.LOREX_NO_LIMITS = "1";
 
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { mkdtempSync } from "node:fs";
 import {
   computeCompression,
   resolveContextBudget,
@@ -19,7 +22,7 @@ import { determineAbstention } from "../synthesis/abstention.js";
 import { generateTopicKey, classifyMemoryType, extractAtomicValue } from "../domain/fact.js";
 import { MockHydraDB } from "../infrastructure/mock-hydradb.js";
 import { LorexEngine } from "../engine.js";
-import { HydraDBError } from "../infrastructure/hydradb-client.js";
+import { HydraDBError } from "../infrastructure/store.js";
 import { resolveIdentity } from "../infrastructure/identity.js";
 import { countTokens } from "../ingestion/token-counter.js";
 
@@ -82,7 +85,7 @@ assert.equal(resolveContextBudget(undefined) <= HARD_CONTEXT_TOKEN_CAP, true);
 
 const identity = resolveIdentity(process.cwd(), { database: "test_user", collection: "test_repo" });
 const client = new MockHydraDB();
-const engine = new LorexEngine(client, identity, 50);
+const engine = new LorexEngine(client, identity);
 await engine.ensureReady();
 
 const r1 = await engine.remember("Use JavaScript", { id: "lang", validFrom: "2025-01-01T00:00:00Z" });
@@ -219,14 +222,14 @@ const brokenClient: typeof client = Object.assign(Object.create(Object.getProtot
     throw new HydraDBError("upstream is down", "network");
   },
 });
-const brokenEngine = new LorexEngine(brokenClient, identity, 10);
+const brokenEngine = new LorexEngine(brokenClient, identity);
 const degraded = await brokenEngine.recall({ query: "anything at all" });
 assert.equal(degraded.abstained, true, "a read fault must abstain, not throw");
 assert.equal(degraded.unavailable, true, "and must say the backend was unavailable");
 
 {
   const ambClient = new MockHydraDB();
-  const ambEngine = new LorexEngine(ambClient, identity, 10);
+  const ambEngine = new LorexEngine(ambClient, identity);
   await ambEngine.ensureReady();
   await ambEngine.remember("We use Postgres for analytics", { id: "analytics_db", validFrom: "2026-01-01T00:00:00Z" });
   await ambEngine.remember("We use MySQL for analytics", { id: "other_analytics", validFrom: "2026-01-02T00:00:00Z" });
@@ -312,3 +315,33 @@ assert.ok(plan.expired.includes("3"), "expired task should be in expired list");
 assert.ok(plan.pruned.includes("4"), "very weak fact should be pruned");
 
 console.log("✓ lifecycle tests passed");
+
+// ── Storage location: dataDir honors env + explicit ──────────────────────────
+
+import { storeDir, storeDbPath } from "../infrastructure/paths.js";
+import { loadConfig, saveConfig } from "../infrastructure/config.js";
+
+{
+  const prevHome = process.env.LOREX_HOME;
+  const prevData = process.env.LOREX_DATA_DIR;
+  const home = mkdtempSync(join(tmpdir(), "lorex-home-cfg-"));
+  process.env.LOREX_HOME = home;
+  delete process.env.LOREX_DATA_DIR;
+
+  assert.ok(storeDbPath().endsWith(join("local-store.db")), "default store path");
+  assert.equal(storeDir("/custom/dir"), "/custom/dir", "explicit dataDir wins");
+
+  saveConfig({ dataDir: "/custom/dir" });
+  assert.equal(loadConfig().dataDir, "/custom/dir", "dataDir persists");
+  assert.equal(storeDbPath(loadConfig().dataDir), join("/custom/dir", "local-store.db"));
+
+  process.env.LOREX_DATA_DIR = "/env/dir";
+  assert.equal(storeDir(loadConfig().dataDir), "/env/dir", "env overrides stored");
+
+  if (prevHome === undefined) delete process.env.LOREX_HOME;
+  else process.env.LOREX_HOME = prevHome;
+  if (prevData === undefined) delete process.env.LOREX_DATA_DIR;
+  else process.env.LOREX_DATA_DIR = prevData;
+}
+
+console.log("✓ config tests passed");

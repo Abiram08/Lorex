@@ -23,7 +23,7 @@ process.env.LOREX_NO_LIMITS = "1";
 function freshEngine(collection: string): { engine: LorexEngine; done: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "lorex-sqlite-eng-"));
   const store = new SqliteStore({ path: join(dir, "test.db") });
-  const engine = new LorexEngine(store, resolveIdentity(dir, { collection }), 1000);
+  const engine = new LorexEngine(store, resolveIdentity(dir, { collection }));
   return { engine, done: () => store.close() };
 }
 
@@ -666,9 +666,43 @@ async function remember(
   assert.equal(stats.total, N);
 
   const u0 = Date.now();
-  const skipped = store.updateStrengths("stress", 24);
+  const recomputed = store.updateStrengths("stress", 24);
   const updateMs = Date.now() - u0;
-  console.log(`  stress: incremental strength pass skipped ${N - skipped}/${N} in ${updateMs}ms`);
+  assert.equal(recomputed, 0, "incremental pass skips all fresh rows at scale");
+  console.log(`  stress: incremental strength pass skipped ${N - recomputed}/${N} in ${updateMs}ms`);
+  done();
+}
+
+// ── Derives edges + expansion weights ────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  await store.ingestMemory({
+    database: "d", collection: "der",
+    memories: [
+      { id: "base1", text: "payment service uses Postgres", additional_metadata: { fact_key: "base1" } },
+      { id: "base2", text: "payment service handles refunds", additional_metadata: { fact_key: "base2" } },
+      {
+        id: "derived", text: "Inferred architectural consequence uniqueword xyz",
+        additional_metadata: { fact_key: "derived", memory_type: "lesson" },
+        relations: { ids: ["base1", "base2"], properties: { type: "derives" } },
+      },
+    ],
+  });
+
+  const rel = await store.contextRelations({ collection: "der" }, ["derived"]);
+  assert.ok(
+    (rel.relations ?? []).filter((r) => r.type === "derives").length === 2,
+    "derives edges stored",
+  );
+
+  const thinking = await store.query({ query: "payment service", database: "d", collection: "der", mode: "thinking" });
+  const via = thinking.chunks.find((c) => c.id === "derived");
+  assert.ok(via, "derived memory pulled via expansion");
+  assert.equal(
+    (via.metadata as Record<string, unknown>).edge_type, "derives",
+    "expansion carries the edge type",
+  );
   done();
 }
 

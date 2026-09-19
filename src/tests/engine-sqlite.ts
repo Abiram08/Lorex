@@ -13,7 +13,7 @@ import { resolveIdentity } from "../infrastructure/identity.js";
 function freshEngine(collection = "eng"): { engine: LorexEngine; done: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "lorex-eng-test-"));
   const store = new SqliteStore({ path: join(dir, "test.db") });
-  const engine = new LorexEngine(store, resolveIdentity(dir, { collection }), 1000);
+  const engine = new LorexEngine(store, resolveIdentity(dir, { collection }));
   return { engine, done: () => store.close() };
 }
 
@@ -175,6 +175,119 @@ function freshEngine(collection = "eng"): { engine: LorexEngine; done: () => voi
   await assert.rejects(() => engine.handoff({ decision: "  " }), /decision is required/);
   await assert.rejects(() => engine.report({ requestId: "  " }), /requestId is required/);
   done();
+}
+
+// ── extends: additive updates keep both current ──────────────────────────────
+
+{
+  const { engine, done } = freshEngine("ext");
+  await engine.remember("We use Redis for session storage", { id: "cache" });
+  await engine.remember("We also use Redis for rate limiting", { id: "cache" });
+
+  const h = await engine.history({ factId: "cache" });
+  assert.ok(h.sources.length >= 2, `extends keeps both versions, got ${h.sources.length}`);
+
+  const q = await engine.recall({ query: "Redis usage" });
+  const texts = q.sources.map((s) => s.content ?? s.excerpt ?? "").join(" ");
+  assert.ok(texts.includes("session") && texts.includes("rate limiting"), "both extended versions recalled");
+
+  // Explicit relation override
+  await engine.remember("Cache is Memcached", { id: "cache", relation: "supersedes" });
+  const h2 = await engine.history({ factId: "cache" });
+  assert.ok(h2.sources.length >= 3, "explicit supersede appends a version");
+  done();
+}
+
+// ── replacement still supersedes ─────────────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("rep");
+  await engine.remember("Primary DB is MongoDB", { id: "db" });
+  await engine.remember("Primary DB is Postgres, switched from MongoDB", { id: "db" });
+
+  const q = await engine.recall({ query: "primary database" });
+  const texts = q.sources.map((s) => s.content ?? s.excerpt ?? "").join(" ");
+  assert.ok(texts.includes("Postgres"), "replacement wins");
+  assert.ok(!texts.includes("MongoDB") || texts.includes("Postgres"), "old value superseded");
+  done();
+}
+
+// ── profile: build, cache, refresh ───────────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("prof");
+  await engine.remember("Always use TypeScript for new services", { id: "ts_pref", scope: "global" });
+  await engine.remember("We decided on Postgres for analytics", { id: "pg" });
+  await engine.remember("Never force-push to main", { id: "ff" });
+
+  const p1 = await engine.profile("project");
+  assert.ok(p1 && !p1.cached, "first profile builds fresh");
+  assert.ok(p1.preferences.some((x) => x.text.includes("TypeScript")), "global prefs in profile");
+  assert.ok(p1.decisions.some((x) => x.text.includes("Postgres")), "decisions in profile");
+  assert.ok(p1.constraints.some((x) => x.includes("force-push")), "constraints in profile");
+
+  const p2 = await engine.profile("project");
+  assert.ok(p2?.cached, "second profile served from cache");
+
+  const p3 = await engine.profile("project", true);
+  assert.ok(p3 && !p3.cached, "forced refresh rebuilds");
+  done();
+}
+
+// ── document ingestion ───────────────────────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("doc");
+  const r = await engine.ingestDocument({
+    text: "Runbook\n\nRestart the worker with systemctl restart lorex-worker.\n\nWe decided to standardize on Postgres for all analytics workloads going forward.",
+    sourceRef: "runbook",
+  });
+  assert.ok(r.chunkCount >= 1, `document yields chunks, got ${r.chunkCount}`);
+  assert.ok(r.factCount >= 1, `document decisions become facts, got ${r.factCount}`);
+
+  const q = await engine.recall({ query: "restart the worker systemctl", type: "knowledge" });
+  assert.ok(
+    q.sources.some((s) => (s.content ?? s.excerpt ?? "").includes("systemctl")),
+    "document chunks retrievable with source",
+  );
+  done();
+}
+
+// ── secret redaction ─────────────────────────────────────────────────────────
+
+{
+  const { engine, done } = freshEngine("sec");
+  await engine.remember("Deploy key is sk-ant-secretkey1234567890 for staging", { id: "deploy_key" });
+  await engine.remember("Contact admin at ops@example.com for access", { id: "contact" });
+
+  const q = await engine.recall({ query: "deploy key staging" });
+  const texts = q.sources.map((s) => s.content ?? s.excerpt ?? "").join(" ");
+  assert.ok(!texts.includes("sk-ant-secretkey"), "API key redacted at write");
+  assert.ok(texts.includes("[REDACTED"), "redaction marker present");
+  done();
+}
+
+// ── Cross-process: two engines, one DB, no forked versions ───────────────────
+{
+  const dir = mkdtempSync(join(tmpdir(), "lorex-xproc-"));
+  const dbPath = join(dir, "shared.db");
+  const ident = { collection: "xproc" };
+  const engineA = new LorexEngine(new SqliteStore({ path: dbPath }), resolveIdentity(dir, ident));
+  const engineB = new LorexEngine(new SqliteStore({ path: dbPath }), resolveIdentity(dir, ident));
+
+  await engineA.remember("Cache layer is Redis", { id: "cache" });
+  await engineB.remember("Cache layer is Memcached because Redis evicted hot keys", { id: "cache" });
+  await engineA.remember("Cache layer is Dragonfly for latency", { id: "cache" });
+
+  const h = await engineA.history({ factId: "cache" });
+  assert.ok(h.sources.length >= 3, `one chain across processes, got ${h.sources.length}`);
+
+  const q = await engineB.recall({ query: "cache layer" });
+  const texts = q.sources.map((s) => s.content ?? s.excerpt ?? "").join(" ");
+  assert.ok(texts.includes("Dragonfly"), "newest version wins across processes");
+
+  const live = h.sources.filter((s) => (s as { status?: string }).status === "current");
+  assert.equal(live.length, 1, `exactly one live version, got ${live.length}`);
 }
 
 // ── oversized fact rejected ──────────────────────────────────────────────────

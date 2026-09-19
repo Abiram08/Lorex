@@ -74,6 +74,14 @@ export async function serveLocal(
         return json(res, 200, { summary: receipt.summary, answer: receipt.answer, sources: receipt.sources });
       }
 
+      // Profile — standing state, no query needed
+      if (method === "GET" && (path === "/profile" || path === "/v4/profile")) {
+        const kind = url.searchParams.get("kind") === "user" ? "user" : "project";
+        const profile = await engine.profile(kind, url.searchParams.has("refresh"));
+        if (!profile) return json(res, 501, { error: "profiles require the local backend", request_id: rid });
+        return json(res, 200, { ...profile, request_id: rid });
+      }
+
       // Add memory
       if (method === "POST" && (path === "/add" || path === "/v4/memories")) {
         const body = await parseJsonBody<{ text?: string; content?: string; id?: string; because?: string }>(req);

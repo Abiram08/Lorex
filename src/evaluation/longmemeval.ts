@@ -5,12 +5,15 @@ process.env.LOREX_NO_LIMITS = "1";
 import { writeFileSync, appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
 import { createInterface } from "node:readline/promises";
 import { MockHydraDB } from "../infrastructure/mock-hydradb.js";
-import { HydraDBClient, type HydraDBLike } from "../infrastructure/hydradb-client.js";
+import { SqliteStore } from "../infrastructure/sqlite-store.js";
+import type { HydraDBLike } from "../infrastructure/store.js";
 import { resolveIdentity } from "../infrastructure/identity.js";
 import { LorexEngine } from "../engine.js";
 import { normalizeSession } from "../ingestion/normalizer.js";
 import { splitIntoTokenChunks } from "../ingestion/token-counter.js";
-import { loadConfig, hydrateEnvFromDotEnv } from "../infrastructure/config.js";
+import { hydrateEnvFromDotEnv } from "../infrastructure/config.js";
+import { join } from "node:path";
+import { lorexHome } from "../infrastructure/paths.js";
 import {
   TARGET_COMPRESSION_RATIO,
   budgetForHaystack,
@@ -130,18 +133,7 @@ type Opts = ReturnType<typeof parseArgs>;
 
 function buildClient(mock: boolean): HydraDBLike {
   if (mock) return new MockHydraDB();
-  try {
-    return new HydraDBClient(loadConfig());
-  } catch {
-    const apiKey = (process.env.HYDRA_DB_API_KEY ?? process.env.HYDRADB_API_KEY ?? "").trim();
-    if (!apiKey) throw new Error("Live mode requires HYDRA_DB_API_KEY (or run `lorex init`).");
-    return new HydraDBClient({
-      apiKey,
-      baseUrl: (process.env.HYDRADB_BASE_URL ?? "https://api.hydradb.com").replace(/\/+$/, ""),
-      timeoutMs: Number(process.env.HYDRADB_TIMEOUT_MS ?? 30_000) || 30_000,
-      queueCap: 200,
-    });
-  }
+  return new SqliteStore({ path: join(lorexHome(), "eval-store.db") });
 }
 
 function normalizeDate(dateStr?: string): string | undefined {
@@ -389,7 +381,7 @@ Judge: ${llm.label}${resolveProviderChain().length > 1 ? " (failover chain)" : "
     database: process.env.LOREX_EVAL_DB ?? "lorex_longmemeval",
     collection: "root",
   });
-  const rootEngine = new LorexEngine(client, rootIdentity, 200);
+  const rootEngine = new LorexEngine(client, rootIdentity);
   await rootEngine.ensureReady();
 
   const lorexTally = newTally("lorex");
@@ -633,8 +625,8 @@ function writeReport(
     disclaimer: !useLlm
       ? "LEXICAL scoring - a retrieval ceiling, NOT accuracy. Never quote as a result."
       : opts.mock
-        ? "MOCK backend with a real LLM judge. A valid accuracy number for THIS retrieval stack, but it measures the bundled mock retriever, not HydraDB. Re-run with --live for a HydraDB claim."
-        : "LIVE HydraDB with LLM judge - valid for claims.",
+        ? "MOCK backend with a real LLM judge. Measures the bundled mock retriever, not the SQLite engine. Re-run with --live for a SQLite claim."
+        : "LIVE SQLite engine with LLM judge - valid for claims.",
     n: total,
     abstention_questions: absTotal,
     incomplete: aborted
@@ -770,7 +762,7 @@ async function main() {
   hydrateEnvFromDotEnv();
   const opts = parseArgs(process.argv.slice(2));
   console.log("\n╔════════════════════════════════════════════════════════════════╗");
-  console.log("║  Lorex × HydraDB — LongMemEval head-to-head                    ║");
+  console.log("║  Lorex × SQLite — LongMemEval head-to-head                      ║");
   console.log("╚════════════════════════════════════════════════════════════════╝");
   await runBenchmark(opts);
 }

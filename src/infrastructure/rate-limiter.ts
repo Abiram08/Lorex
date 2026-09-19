@@ -1,4 +1,4 @@
-/** Persisted usage limiter: protects the HydraDB quota from runaway agents. */
+/** Persisted usage limiter: protects the local store from runaway agents. */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";

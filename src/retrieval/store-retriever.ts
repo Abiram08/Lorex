@@ -1,7 +1,7 @@
-/** HydraDB query wrapper with error classification. */
+/** Store query wrapper with error classification. */
 
-import type { HydraDBLike, QueryInput, QueryResult, QueryChunk } from "../infrastructure/hydradb-client.js";
-import { HydraDBError } from "../infrastructure/hydradb-client.js";
+import type { HydraDBLike, QueryInput, QueryResult, QueryChunk } from "../infrastructure/store.js";
+import { HydraDBError } from "../infrastructure/store.js";
 
 export interface RetrieveOptions {
   database: string;

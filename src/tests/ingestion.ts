@@ -64,10 +64,10 @@ function ev(role: "user" | "assistant", content: string, n = 0): ConversationEve
 
 {
   const events = [
-    ev("user", "We decided to use Redis for sessions.", 0),
-    ev("user", "We decided to use Redis for sessions!  ", 1),
-    ev("assistant", "We decided to use Redis for sessions.", 2),
-    ev("user", "Something completely different here.", 3),
+    ev("user", "We decided to use Redis for sessions."),
+    ev("user", "We decided to use Redis for sessions!  "),
+    ev("assistant", "We decided to use Redis for sessions."),
+    ev("user", "Something completely different here."),
   ];
   const r = deduplicateEvents(events);
   assert.equal(r.events.length, 3, "exact dupe removed, cross-role kept");
@@ -81,12 +81,12 @@ function ev(role: "user" | "assistant", content: string, n = 0): ConversationEve
 
 {
   const facts = extractFacts([
-    ev("user", "We decided to migrate session storage from MongoDB to Redis because Atlas kept timing out under load.", 0),
-    ev("user", "I always prefer TypeScript over JavaScript for new services.", 1),
-    ev("user", "Never commit secrets to the repo, use the vault instead.", 2),
-    ev("user", "Thanks!", 3),
-    ev("user", "ok", 4),
-    ev("assistant", "Maybe we could possibly consider trying something at some point?", 5),
+    ev("user", "We decided to migrate session storage from MongoDB to Redis because Atlas kept timing out under load."),
+    ev("user", "I always prefer TypeScript over JavaScript for new services."),
+    ev("user", "Never commit secrets to the repo, use the vault instead."),
+    ev("user", "Thanks!"),
+    ev("user", "ok"),
+    ev("assistant", "Maybe we could possibly consider trying something at some point?"),
   ]);
   const types = facts.map((f) => f.memoryType);
   assert.ok(types.includes("decision"), `decision extracted, got ${types}`);
@@ -97,7 +97,7 @@ function ev(role: "user" | "assistant", content: string, n = 0): ConversationEve
   assert.ok(facts.every((f) => f.confidence >= 0 && f.confidence <= 1), "confidence bounded");
 
   const corrections = extractFacts([
-    ev("user", "Actually that's wrong, we use Memcached now, changed from Redis last week.", 0),
+    ev("user", "Actually that's wrong, we use Memcached now, changed from Redis last week."),
   ]);
   assert.ok(corrections.some((f) => f.isCorrection), "correction flagged");
 }
@@ -113,6 +113,35 @@ function ev(role: "user" | "assistant", content: string, n = 0): ConversationEve
 
 console.log("✓ ingestion tests passed");
 
+// ── Secret redaction ─────────────────────────────────────────────────────────
+
+import { redactSecrets } from "../infrastructure/secrets.js";
+
+{
+  const key = redactSecrets("Deploy with sk-ant-abcdefghij1234567890 tonight");
+  assert.ok(key.redacted && !key.text.includes("sk-ant-"), "Anthropic key redacted");
+
+  const gh = redactSecrets("token ghp_abcdefghij1234567890 in config");
+  assert.ok(gh.redacted && !gh.text.includes("ghp_"), "GitHub token redacted");
+
+  const aws = redactSecrets("using AKIAIOSFODNN7EXAMPLE here");
+  assert.ok(aws.redacted, "AWS key redacted");
+
+  const pw = redactSecrets("password: s3cr3t-value here");
+  assert.ok(pw.redacted && !pw.text.includes("s3cr3t"), "password assignment redacted");
+
+  const pem = redactSecrets("key:\n-----BEGIN PRIVATE KEY-----\nMIIBvTBX\n-----END PRIVATE KEY-----");
+  assert.ok(pem.redacted && !pem.text.includes("MIIB"), "private key block redacted");
+
+  const mail = redactSecrets("contact ops@example.com for help");
+  assert.ok(mail.redacted, "email redacted");
+
+  const clean = redactSecrets("We decided to use Redis for sessions because it is fast.");
+  assert.ok(!clean.redacted && clean.text.includes("Redis"), "normal text untouched");
+}
+
+console.log("✓ secrets tests passed");
+
 // ── Multi-format transcript parsing ──────────────────────────────────────────
 
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -125,7 +154,7 @@ import { captureTranscript } from "../ingestion/session-capture.js";
 
 {
   const dir = mkdtempSync(join(tmpdir(), "lorex-parse-test-"));
-  const engine = new LorexEngine(new MockHydraDB(), resolveIdentity(dir, { collection: "parse" }), 1000);
+  const engine = new LorexEngine(new MockHydraDB(), resolveIdentity(dir, { collection: "parse" }));
 
   const openai = join(dir, "openai.jsonl");
   writeFileSync(openai, [
@@ -150,3 +179,37 @@ import { captureTranscript } from "../ingestion/session-capture.js";
 }
 
 console.log("✓ transcript parser tests passed");
+
+// ── Incremental capture: cursor skips ingested turns ─────────────────────────
+
+{
+  const home = mkdtempSync(join(tmpdir(), "lorex-cur-home-"));
+  const prevHome = process.env.LOREX_HOME;
+  process.env.LOREX_HOME = home;
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "lorex-cur-test-"));
+    const engine = new LorexEngine(new MockHydraDB(), resolveIdentity(dir, { collection: "cur" }));
+    const tpath = join(dir, "sess.jsonl");
+    const line = (n: number, text: string) => JSON.stringify({ role: n % 2 ? "assistant" : "user", content: text });
+
+    writeFileSync(tpath, [line(0, "We decided to use Redis for sessions."), line(1, "Noted.")].join("\n"));
+    const first = await captureTranscript(engine, { transcriptPath: tpath, incremental: true });
+    assert.ok(first.factCount >= 1, `first capture ingests, got ${first.factCount} facts`);
+
+    const second = await captureTranscript(engine, { transcriptPath: tpath, incremental: true });
+    assert.equal(second.chunkCount, 0, "second capture is a no-op (cursor)");
+
+    writeFileSync(tpath, [line(0, "We decided to use Redis for sessions."), line(1, "Noted."), line(2, "We also decided on Postgres for analytics workloads.")].join("\n"));
+    const third = await captureTranscript(engine, { transcriptPath: tpath, incremental: true });
+    assert.ok(third.chunkCount >= 1, "appended turns get ingested");
+    assert.ok(third.factCount >= 1, "new decision extracted from appended turns");
+
+    const full = await captureTranscript(engine, { transcriptPath: tpath });
+    assert.ok(full.chunkCount >= 1, "explicit capture re-ingests fully");
+  } finally {
+    if (prevHome === undefined) delete process.env.LOREX_HOME;
+    else process.env.LOREX_HOME = prevHome;
+  }
+}
+
+console.log("✓ incremental capture tests passed");

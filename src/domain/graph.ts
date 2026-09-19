@@ -12,6 +12,8 @@ export type NodeKind =
 
 export type EdgeKind =
   | "supersedes"
+  | "extends"
+  | "derives"
   | "relates"
   | "authored"
   | "evidence"
@@ -227,7 +229,7 @@ export function buildContextGraph(
     edges.push({
       source: from,
       target: to,
-      kind: rel.type === "supersedes" ? "supersedes" : "relates",
+      kind: rel.type === "supersedes" || rel.type === "extends" || rel.type === "derives" ? rel.type : "relates",
       label: rel.type,
     });
   }

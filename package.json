@@ -18,7 +18,7 @@
     "init": "node dist/index.js init",
     "doctor": "node dist/index.js doctor",
     "dashboard": "node dist/index.js dashboard",
-    "test": "npm run test:core && npm run test:sqlite && npm run test:engine && npm run test:retrieval && npm run test:ingestion && npm run test:server && npm run test:hooks && npm run test:capabilities && npm run test:infra && npm run verify",
+    "test": "npm run test:core && npm run test:sqlite && npm run test:engine && npm run test:retrieval && npm run test:ingestion && npm run test:server && npm run test:hooks && npm run test:embeddings && npm run test:capabilities && npm run test:infra && npm run verify",
     "test:core": "tsx src/tests/core.ts",
     "test:sqlite": "tsx src/tests/sqlite.ts",
     "test:engine": "tsx src/tests/engine-sqlite.ts",
@@ -26,6 +26,7 @@
     "test:ingestion": "tsx src/tests/ingestion.ts",
     "test:server": "tsx src/tests/server.ts",
     "test:hooks": "tsx src/tests/hooks.ts",
+    "test:embeddings": "tsx src/tests/embeddings.ts",
     "test:capabilities": "tsx src/tests/requirements.ts",
     "test:infra": "tsx src/tests/infrastructure.ts",
     "demo": "tsx src/demo-crossagent.ts",
@@ -46,7 +47,8 @@
     "mcp",
     "agent-memory",
     "context",
-    "hydradb",
+    "local-first",
+    "sqlite",
     "retrieval",
     "longmemeval"
   ],
@@ -57,6 +59,7 @@
     "@modelcontextprotocol/sdk": "^1.0.4",
     "better-sqlite3": "^13.0.3",
     "js-tiktoken": "^1.0.21",
+    "pdf-parse": "^2.4.5",
     "zod": "^3.23.8"
   },
   "devDependencies": {

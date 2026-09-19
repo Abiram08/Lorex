@@ -1,8 +1,7 @@
 /** LorexEngine: every memory and context operation, returning a Receipt. */
 
-import type { HydraDBLike, MemoryItem, QueryChunk, FeedbackInput } from "./infrastructure/hydradb-client.js";
+import type { HydraDBLike, MemoryItem, QueryChunk, FeedbackInput } from "./infrastructure/store.js";
 import type { Identity } from "./infrastructure/identity.js";
-import { WriteQueue } from "./infrastructure/write-queue.js";
 import {
   METADATA_SCHEMA_VERSION,
   type Receipt,
@@ -25,12 +24,13 @@ import {
 import {
   extractReason,
   extractTransition,
+  detectExtension,
   renderCausalChain,
   type CausalChain,
   type CausalLink,
   type CausalSource,
 } from "./domain/causality.js";
-import { retrieve } from "./retrieval/hydradb-retriever.js";
+import { retrieve } from "./retrieval/store-retriever.js";
 import { assembleEvidence, synthesizeTimeline, synthesizeAnswer } from "./retrieval/evidence-assembler.js";
 import { determineAbstention, MIN_LEXICAL_RELEVANCE_AGGREGATE } from "./synthesis/abstention.js";
 import {
@@ -43,10 +43,27 @@ import { ingestSession as runSessionIngestion, type FactIndex } from "./ingestio
 import { llmExtractionEnabled } from "./ingestion/extractor.js";
 import type { NormalizedSession } from "./domain/session.js";
 import { LIMITS, assertMaxLength, clampInt } from "./infrastructure/limits.js";
-import { HydraDBError } from "./infrastructure/hydradb-client.js";
 import { RateLimiter, RateLimitError } from "./infrastructure/rate-limiter.js";
 import { computeCompression, resolveContextBudget } from "./domain/compression.js";
 import { countTokens } from "./ingestion/token-counter.js";
+import { redactSecrets } from "./infrastructure/secrets.js";
+
+async function extractPdfText(path: string): Promise<string> {
+  const { readFileSync } = await import("node:fs");
+  const { PDFParse } = (await import("pdf-parse")) as unknown as {
+    PDFParse: new (opts: { data: Buffer }) => {
+      getText(): Promise<{ text?: string; total?: number }>;
+      destroy(): Promise<void>;
+    };
+  };
+  const parser = new PDFParse({ data: readFileSync(path) });
+  try {
+    const result = await parser.getText();
+    return result.text ?? "";
+  } finally {
+    await parser.destroy().catch(() => undefined);
+  }
+}
 import { dreamHeuristic, type DreamOptions, type DreamResult } from "./infrastructure/dream.js";
 import { planConsolidation } from "./infrastructure/lifecycle.js";
 import type { SqliteStore } from "./infrastructure/sqlite-store.js";
@@ -65,10 +82,23 @@ export interface RememberOpts {
   agent?: string;
   /** "global" writes to the shared user-level collection visible everywhere. */
   scope?: "global" | "project";
+  /** Explicit edge to the current version: extends keeps both current. */
+  relation?: "supersedes" | "extends";
 }
 
-export interface RecallOpts {
-  query?: string;
+export interface ProfileSnapshot {
+  collection: string;
+  kind: "user" | "project";
+  updatedAt: string;
+  cached: boolean;
+  preferences: Array<{ text: string; strength: number }>;
+  decisions: Array<{ text: string; created_at: string }>;
+  constraints: string[];
+  openLoops: Array<{ text: string; age_days: number }>;
+  lastHandoff?: { decision: string; nextStep?: string; at: string };
+}
+
+export interface RecallOpts {  query?: string;
   asOf?: string;
   mode?: "fast" | "thinking";
   type?: "memory" | "knowledge" | "all";
@@ -87,7 +117,6 @@ export interface RecallOpts {
 }
 
 export class LorexEngine {
-  readonly queue: WriteQueue;
   private ready = false;
   private readyPromise: Promise<void> | null = null;
   private corpusTokens = 0;
@@ -101,17 +130,9 @@ export class LorexEngine {
   constructor(
     private readonly client: HydraDBLike,
     private readonly identity: Identity,
-    queueCap: number,
-    sharedQueue?: WriteQueue,
     sharedLimiter?: RateLimiter,
   ) {
     this.limiter = sharedLimiter ?? new RateLimiter();
-    if (sharedQueue) {
-      this.queue = sharedQueue;
-      return;
-    }
-    this.queue = new WriteQueue(client, queueCap);
-    this.queue.startAutoFlush();
   }
 
   readonly limiter: RateLimiter;
@@ -207,12 +228,64 @@ export class LorexEngine {
     await this.readyPromise;
   }
 
-  get queueLength(): number {
-    return this.queue.length;
-  }
-
   getIdentity(): Identity {
     return this.identity;
+  }
+
+  /**
+   * Documents in, memories out: read a file, URL, or raw text, split into
+   * paragraph turns, and run the standard session pipeline with the source
+   * stamped on every chunk and fact.
+   */
+  async ingestDocument(input: {
+    path?: string;
+    url?: string;
+    text?: string;
+    sourceRef?: string;
+    sessionId?: string;
+  }): Promise<import("./ingestion/pipeline.js").IngestionResult> {
+    await this.ensureReady();
+    let content: string;
+    const sourceRef = input.sourceRef ?? input.path ?? input.url ?? "inline";
+
+    if (input.text !== undefined) {
+      content = input.text;
+    } else if (input.path) {
+      const { readFileSync, existsSync, statSync } = await import("node:fs");
+      if (!existsSync(input.path)) throw new Error(`file not found: ${input.path}`);
+      if (statSync(input.path).size > LIMITS.maxContentChars * 4) {
+        throw new Error(`file too large (max ~${LIMITS.maxContentChars * 4} bytes)`);
+      }
+      if (input.path.toLowerCase().endsWith(".pdf")) {
+        content = await extractPdfText(input.path);
+      } else {
+        content = readFileSync(input.path, "utf8");
+      }
+    } else if (input.url) {
+      const res = await fetch(input.url, { signal: AbortSignal.timeout(15_000) });
+      if (!res.ok) throw new Error(`fetch failed: ${res.status} ${input.url}`);
+      content = (await res.text()).slice(0, LIMITS.maxContentChars);
+    } else {
+      throw new Error("path, url, or text is required");
+    }
+
+    const paragraphs = content
+      .split(/\n\s*\n/)
+      .map((p) => p.trim())
+      .filter((p) => p.length >= 20)
+      .slice(0, 100);
+    if (!paragraphs.length) throw new Error("document has no ingestible content");
+
+    const { normalizeSession } = await import("./ingestion/normalizer.js");
+    const sessionId = input.sessionId ?? `doc_${Date.now().toString(36)}`;
+    const session = normalizeSession(
+      sessionId,
+      this.identity.database,
+      this.identity.collection,
+      paragraphs.map((p) => ({ role: "user" as const, content: p })),
+      { agent: this.agent, source: sourceRef },
+    );
+    return this.ingestSession(session);
   }
 
   async ingestSession(
@@ -262,8 +335,6 @@ export class LorexEngine {
     const sibling = new LorexEngine(
       this.client,
       { ...this.identity, collection, collectionLabel: collection },
-      0,
-      this.queue,
       this.limiter,
     );
     sibling.ready = this.ready;
@@ -288,20 +359,22 @@ export class LorexEngine {
 
     const factKey = generateTopicKey(body, opts.id);
     const versionId = makeVersionId(factKey);
-    const atomic = extractAtomicValue(body);
+    const atomic = redactSecrets(extractAtomicValue(body)).text;
 
     const known = this.factIndex.get(factKey);
-    const current =
-      known && Date.parse(known.validFrom || "0") <= Date.parse(validFrom)
+    // The store is source of truth: the in-memory index goes stale across
+    // processes (CLI + MCP server + hooks each hold their own). It only
+    // fills in when the store has nothing (indexing lag, hash-key FTS miss).
+    const current = (await this.findCurrentFactVersion(factKey)) ??
+      (known && Date.parse(known.validFrom || "0") <= Date.parse(validFrom)
         ? { versionId: known.versionId, factKey, text: known.text, metadata: known.metadata }
-        : await this.findCurrentFactVersion(factKey);
+        : undefined);
 
     this.limiter.acquire("write");
     this.limiter.acquire("ingest_tokens", countTokens(atomic));
 
     // Write the new version FIRST; only close the old one after it lands, so a
     // failed write never leaves the fact with no live version.
-    const supersedes = current?.versionId;
     const reason = opts.because?.trim() || extractReason(body);
     const reasonSource: "explicit" | "extracted" | "unknown" = opts.because?.trim()
       ? "explicit"
@@ -310,15 +383,21 @@ export class LorexEngine {
         : "unknown";
     const transition = extractTransition(body);
     const targetCollection = opts.scope === "global" ? "global" : this.identity.collection;
+    // Additive update ("we also use X") extends the topic: both versions stay
+    // current. Replacement ("we switched to X") supersedes. Explicit relation wins.
+    const isExtension = opts.relation
+      ? opts.relation === "extends"
+      : !!current?.versionId && !opts.because && detectExtension(body, !!(transition.from || transition.to));
 
     const status = opts.forget ? "forgotten" : opts.validTo ? "superseded" : "current";
+    const relationType = isExtension ? "extends" : "supersedes";
     const item: MemoryItem = {
       id: versionId,
       text: atomic,
       infer: true,
       expiry_time: opts.ttlSeconds,
-      relations: supersedes
-        ? { ids: [supersedes], properties: { type: "supersedes", reason: reason ?? null } }
+      relations: current?.versionId
+        ? { ids: [current.versionId], properties: { type: relationType, reason: reason ?? null } }
         : undefined,
       additional_metadata: {
         schema_version: METADATA_SCHEMA_VERSION,
@@ -329,7 +408,7 @@ export class LorexEngine {
         recorded_at: recordedAt,
         fact_key: factKey,
         version_id: versionId,
-        supersedes,
+        supersedes: isExtension ? undefined : current?.versionId,
         memory_type: classifyMemoryType(atomic),
         status,
         trust: "agent_explicit",
@@ -341,36 +420,24 @@ export class LorexEngine {
       },
     };
 
-    try {
-      const res = await this.client.ingestMemory({
-        database: this.identity.database,
-        collection: targetCollection,
-        memories: [item],
-      });
-      await this.client.awaitIndexed(res.ids, LIMITS.indexMaxAttempts, LIMITS.indexIntervalMs, {
-        database: this.identity.database,
-        collection: targetCollection,
-      });
-      this.trackTokens(atomic);
-      this.rememberVersion(factKey, versionId, validFrom, atomic, item.additional_metadata!);
-      if (current && supersedes) await this.closeFactVersion(current, validFrom);
-      return this.ingestReceipt(true, "memory", {
-        ids: res.ids,
-        requestId: res.requestId,
-        factKey,
-        versionId,
-      });
-    } catch (e) {
-      if (isPermanentError(e)) throw e;
-      this.queue.enqueueMemory({
-        database: this.identity.database,
-        collection: this.identity.collection,
-        memories: [item],
-      }, (e as Error).message);
-      this.trackTokens(atomic);
-      this.rememberVersion(factKey, versionId, validFrom, atomic, item.additional_metadata!);
-      return this.ingestReceipt(false, "memory", { queued: true, factKey, versionId });
-    }
+    const res = await this.client.ingestMemory({
+      database: this.identity.database,
+      collection: targetCollection,
+      memories: [item],
+    });
+    await this.client.awaitIndexed(res.ids, LIMITS.indexMaxAttempts, LIMITS.indexIntervalMs, {
+      database: this.identity.database,
+      collection: targetCollection,
+    });
+    this.trackTokens(atomic);
+    this.rememberVersion(factKey, versionId, validFrom, atomic, item.additional_metadata!);
+    if (current && !isExtension) await this.closeFactVersion(current, validFrom);
+    return this.ingestReceipt(true, "memory", {
+      ids: res.ids,
+      requestId: res.requestId,
+      factKey,
+      versionId,
+    });
   }
 
   async forget(opts: { factId?: string; query?: string }): Promise<Receipt> {
@@ -495,20 +562,11 @@ export class LorexEngine {
     // Internal follow-up write of an already-gated operation: counted, not
     // re-checked, so closing a version can never throw mid-operation.
     this.limiter.consume("write");
-    try {
-      await this.client.ingestMemory({
-        database: this.identity.database,
-        collection: this.identity.collection,
-        memories: [closedItem],
-      });
-    } catch (e) {
-      if (isPermanentError(e)) return;
-      this.queue.enqueueMemory({
-        database: this.identity.database,
-        collection: this.identity.collection,
-        memories: [closedItem],
-      }, (e as Error).message);
-    }
+    await this.client.ingestMemory({
+      database: this.identity.database,
+      collection: this.identity.collection,
+      memories: [closedItem],
+    });
   }
 
   async learn(content: string, sourceRef?: string): Promise<Receipt> {
@@ -530,28 +588,17 @@ export class LorexEngine {
       url: sourceRef,
     };
 
-    try {
-      const res = await this.client.ingestKnowledge({
-        database: this.identity.database,
-        collection: this.identity.collection,
-        documents: [doc],
-      });
-      await this.client.awaitIndexed(res.ids, LIMITS.indexMaxAttempts, LIMITS.indexIntervalMs, {
-        database: this.identity.database,
-        collection: this.identity.collection,
-      });
-      this.trackTokens(body);
-      return this.ingestReceipt(true, "knowledge", { ids: res.ids, requestId: res.requestId });
-    } catch (e) {
-      if (isPermanentError(e)) throw e;
-      this.queue.enqueueKnowledge({
-        database: this.identity.database,
-        collection: this.identity.collection,
-        documents: [doc],
-      }, (e as Error).message);
-      this.trackTokens(body);
-      return this.ingestReceipt(false, "knowledge", { queued: true });
-    }
+    const res = await this.client.ingestKnowledge({
+      database: this.identity.database,
+      collection: this.identity.collection,
+      documents: [doc],
+    });
+    await this.client.awaitIndexed(res.ids, LIMITS.indexMaxAttempts, LIMITS.indexIntervalMs, {
+      database: this.identity.database,
+      collection: this.identity.collection,
+    });
+    this.trackTokens(body);
+    return this.ingestReceipt(true, "knowledge", { ids: res.ids, requestId: res.requestId });
   }
 
   async recall(opts: RecallOpts = {}): Promise<Receipt> {
@@ -972,45 +1019,26 @@ export class LorexEngine {
       },
     };
 
-    try {
-      const res = await this.client.ingestMemory({
-        database: this.identity.database,
-        collection: this.identity.collection,
-        memories: [item],
-      });
-      await this.client.awaitIndexed(res.ids, LIMITS.indexMaxAttempts, LIMITS.indexIntervalMs, {
-        database: this.identity.database,
-        collection: this.identity.collection,
-      });
-      this.trackTokens(body);
-      return {
-        op: "ingest",
-        sources: [],
-        mode_used: "fast",
-        request_id: res.requestId,
-        token_cost: countTokens(body),
-        abstained: false,
-        result: { version_id: versionId, agent, next_step: input.nextStep },
-        summary: `Handoff recorded by ${agent}${input.nextStep ? ` · next: ${input.nextStep}` : ""}`,
-      };
-    } catch (e) {
-      if (isPermanentError(e)) throw e;
-      this.queue.enqueueMemory(
-        { database: this.identity.database, collection: this.identity.collection, memories: [item] },
-        (e as Error).message,
-      );
-      this.trackTokens(body);
-      return {
-        op: "ingest",
-        sources: [],
-        mode_used: "fast",
-        token_cost: countTokens(body),
-        abstained: false,
-        queued: true,
-        result: { version_id: versionId, agent },
-        summary: `Handoff queued for delivery (${agent}).`,
-      };
-    }
+    const res = await this.client.ingestMemory({
+      database: this.identity.database,
+      collection: this.identity.collection,
+      memories: [item],
+    });
+    await this.client.awaitIndexed(res.ids, LIMITS.indexMaxAttempts, LIMITS.indexIntervalMs, {
+      database: this.identity.database,
+      collection: this.identity.collection,
+    });
+    this.trackTokens(body);
+    return {
+      op: "ingest",
+      sources: [],
+      mode_used: "fast",
+      request_id: res.requestId,
+      token_cost: countTokens(body),
+      abstained: false,
+      result: { version_id: versionId, agent, next_step: input.nextStep },
+      summary: `Handoff recorded by ${agent}${input.nextStep ? ` · next: ${input.nextStep}` : ""}`,
+    };
   }
 
   async resume(): Promise<Receipt> {
@@ -1079,9 +1107,12 @@ export class LorexEngine {
       await this.client.ingestMemory({
         database: this.identity.database,
         collection: this.identity.collection,
-        memories: result.discovered.map((d) => ({
-          id: `dream_${d.factKey}_${Date.now().toString(36)}`,
-          text: d.text,
+      memories: result.discovered.map((d) => ({
+        id: `dream_${d.factKey}_${Date.now().toString(36)}`,
+        text: d.text,
+        relations: d.sourceIds.length
+          ? { ids: d.sourceIds.slice(0, 10), properties: { type: "derives" } }
+          : undefined,
           additional_metadata: {
             schema_version: METADATA_SCHEMA_VERSION,
             fact_key: d.factKey,
@@ -1130,6 +1161,53 @@ export class LorexEngine {
     return store ? store.getOpenLoops(this.identity.collection) : [];
   }
 
+  /** Standing state, maintained not queried. Refreshes when stale (>1h) or forced. */
+  async profile(kind: "user" | "project" = "project", refresh = false): Promise<ProfileSnapshot | null> {
+    await this.ensureReady();
+    const store = this.lifecycleStore;
+    if (!store) return null;
+
+    if (!refresh) {
+      const cached = store.getProfile(this.identity.collection, kind);
+      // SQLite datetime('now') has no TZ designator and is always UTC.
+      const at = cached ? Date.parse(cached.updated_at.includes("T") ? cached.updated_at : `${cached.updated_at}Z`) : NaN;
+      if (cached && !Number.isNaN(at) && Date.now() - at < 3_600_000) {
+        return { ...(cached.body as unknown as ProfileSnapshot), cached: true };
+      }
+    }
+    return this.refreshProfile(kind);
+  }
+
+  async refreshProfile(kind: "user" | "project" = "project"): Promise<ProfileSnapshot | null> {
+    await this.ensureReady();
+    const store = this.lifecycleStore;
+    if (!store) return null;
+
+    const collection = this.identity.collection;
+    const prefs = [
+      ...store.topByType("global", "preference", 10),
+      ...(kind === "user" ? store.topByType(collection, "preference", 10) : []),
+    ];
+    const decisions = store.topByType(collection, "decision", 10);
+    const constraints = store.topByType(collection, "constraint", 10);
+    const loops = store.getOpenLoops(collection).slice(0, 10);
+    const handoffs = store.topByType(collection, "handoff", 1);
+
+    const snapshot: ProfileSnapshot = {
+      collection,
+      kind,
+      updatedAt: new Date().toISOString(),
+      cached: false,
+      preferences: prefs.slice(0, 10).map((p) => ({ text: p.text, strength: p.strength })),
+      decisions: decisions.map((d) => ({ text: d.text, created_at: d.created_at })),
+      constraints: constraints.map((c) => c.text),
+      openLoops: loops.map((l) => ({ text: l.text, age_days: l.age_days })),
+      lastHandoff: handoffs[0] ? { decision: handoffs[0].text, at: handoffs[0].created_at } : undefined,
+    };
+    store.saveProfile(collection, kind, snapshot as unknown as Record<string, unknown>);
+    return snapshot;
+  }
+
   /** Dump rows for backup or cross-machine sync. Null when backend can't export. */
   async exportData(collection?: string): Promise<Array<Record<string, unknown>> | null> {
     await this.ensureReady();
@@ -1164,21 +1242,7 @@ export class LorexEngine {
       ground_truth: input.answer ? { answer: input.answer, source_ids: input.sourceIds } : undefined,
       metadata: { agent: "lorex", ...(input.query ? { query: input.query } : {}) },
     };
-    try {
-      await this.client.feedback(feedback);
-    } catch (error) {
-      this.queue.enqueueFeedback(feedback, error instanceof Error ? error.message : String(error));
-      return {
-        op: "feedback",
-        sources: [],
-        mode_used: "fast",
-        request_id: input.requestId,
-        token_cost: 0,
-        abstained: false,
-        queued: true,
-        summary: "Feedback queued for delivery to HydraDB.",
-      };
-    }
+    await this.client.feedback(feedback);
 
     return {
       op: "feedback",
@@ -1187,7 +1251,7 @@ export class LorexEngine {
       request_id: input.requestId,
       token_cost: 0,
       abstained: false,
-      summary: "Feedback sent to HydraDB.",
+      summary: "Feedback recorded.",
     };
   }
 
@@ -1209,6 +1273,16 @@ export class LorexEngine {
     text?: string;
     metadata?: Record<string, unknown>;
   } | undefined> {
+    // Exact lookup first: correct across processes, no FTS involved.
+    const store = this.client as Partial<{
+      getCurrentByFactKey(collection: string, factKey: string): {
+        versionId: string; text: string; metadata: Record<string, unknown>;
+      } | null;
+    }>;
+    if (typeof store.getCurrentByFactKey === "function") {
+      const exact = store.getCurrentByFactKey(this.identity.collection, factKey);
+      if (exact) return { versionId: exact.versionId, factKey, text: exact.text, metadata: exact.metadata };
+    }
     const result = await retrieve(this.client, {
       database: this.identity.database,
       collection: this.identity.collection,
@@ -1354,14 +1428,6 @@ function resolveCurrentVersions(chunks: QueryChunk[]): QueryChunk[] {
       metadata: { ...md, status: "superseded", status_source: "derived" },
     };
   });
-}
-
-function isPermanentError(error: unknown): boolean {
-  if (error instanceof HydraDBError) {
-    return error.kind === "auth" || error.kind === "client";
-  }
-  const kind = (error as { kind?: string }).kind;
-  return kind === "auth" || kind === "client";
 }
 
 function detectDisputes(chunks: QueryChunk[]): Array<{ factKey: string; versionIds: string[]; values: string[] }> {

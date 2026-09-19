@@ -11,7 +11,7 @@ import { LorexEngine } from "../engine.js";
 import { LIMITS } from "../infrastructure/limits.js";
 import { VERSION } from "../infrastructure/version.js";
 import { RateLimitError } from "../infrastructure/rate-limiter.js";
-import { HydraDBError } from "../infrastructure/hydradb-client.js";
+import { HydraDBError } from "../infrastructure/store.js";
 
 const RememberSchema = z.object({
   fact: z.string().min(1).max(LIMITS.maxFactChars),
@@ -23,11 +23,14 @@ const RememberSchema = z.object({
   because: z.string().max(1000).optional(),
   agent: z.string().max(64).optional(),
   scope: z.enum(["global", "project"]).optional(),
+  relation: z.enum(["supersedes", "extends"]).optional(),
 });
 
 const LearnSchema = z.object({
-  content: z.string().min(1).max(LIMITS.maxContentChars),
+  content: z.string().min(1).max(LIMITS.maxContentChars).optional(),
   sourceRef: z.string().max(LIMITS.maxSourceRefChars).optional(),
+  file: z.string().max(1024).optional(),
+  url: z.string().max(2048).optional(),
 });
 
 const RecallSchema = z.object({
@@ -151,6 +154,7 @@ export function createServer(engine: LorexEngine): Server {
             because: { type: "string", description: "Why this replaces the previous value" },
             agent: { type: "string" },
             scope: { type: "string", enum: ["global", "project"], description: "global = user-level, visible from every project" },
+            relation: { type: "string", enum: ["supersedes", "extends"], description: "extends keeps both versions current" },
           },
           required: ["fact"],
           additionalProperties: false,
@@ -158,11 +162,15 @@ export function createServer(engine: LorexEngine): Server {
       },
       {
         name: "learn",
-        description: "Store raw grounding content verbatim (docs/transcripts).",
+        description: "Store raw grounding content verbatim (docs/transcripts), or ingest a file/URL as a document.",
         inputSchema: {
           type: "object",
-          properties: { content: { type: "string" }, sourceRef: { type: "string" } },
-          required: ["content"],
+          properties: {
+            content: { type: "string" },
+            sourceRef: { type: "string" },
+            file: { type: "string", description: "Local file path to ingest as a document" },
+            url: { type: "string", description: "URL to fetch and ingest as a document" },
+          },
           additionalProperties: false,
         },
       },
@@ -266,12 +274,12 @@ export function createServer(engine: LorexEngine): Server {
       },
       {
         name: "usage",
-        description: "Show Lorex rate-limit usage (writes/queries/ingest budget) and pending write queue.",
+        description: "Show Lorex rate-limit usage (writes/queries/ingest budget).",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
       },
       {
         name: "report",
-        description: "Send retrieval feedback to HydraDB /feedback.",
+        description: "Send retrieval feedback (adjusts future ranking).",
         inputSchema: {
           type: "object",
           properties: {
@@ -307,6 +315,19 @@ export function createServer(engine: LorexEngine): Server {
         description: "Tasks recorded but never acted on (unfinished work).",
         inputSchema: { type: "object", properties: {}, additionalProperties: false },
       },
+      {
+        name: "profile",
+        description:
+          "Standing user/project state: preferences, decisions, constraints, open loops, last handoff. Maintained, not retrieved — no query needed.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["user", "project"] },
+            refresh: { type: "boolean" },
+          },
+          additionalProperties: false,
+        },
+      },
     ],
   }));
 
@@ -332,6 +353,20 @@ export function createServer(engine: LorexEngine): Server {
         case "learn": {
           const parsed = LearnSchema.safeParse(args);
           if (!parsed.success) return badArgs(parsed.error.message);
+          if (parsed.data.file ?? parsed.data.url) {
+            const result = await engine.ingestDocument({ path: parsed.data.file, url: parsed.data.url });
+            receipt = {
+              op: "ingest" as const,
+              sources: [],
+              mode_used: "fast" as const,
+              token_cost: result.tokenCount,
+              abstained: false,
+              summary: `Ingested document: ${result.chunkCount} chunks, ${result.factCount} facts.`,
+              result,
+            };
+            break;
+          }
+          if (!parsed.data.content) return badArgs("content, file, or url is required");
           receipt = await engine.learn(parsed.data.content, parsed.data.sourceRef);
           break;
         }
@@ -362,7 +397,7 @@ export function createServer(engine: LorexEngine): Server {
             summary:
               `Writes ${u.writesThisHour}/${u.limits.writesPerHour} per hour, ${u.writesToday}/${u.limits.writesPerDay} today; ` +
               `queries ${u.queriesThisHour}/${u.limits.queriesPerHour} this hour; ` +
-              `ingest ${u.ingestTokensToday}/${u.limits.ingestTokensPerDay} tokens today; queue ${engine.queueLength}.`,
+              `ingest ${u.ingestTokensToday}/${u.limits.ingestTokensPerDay} tokens today.`,
             result: u as unknown as Record<string, unknown>,
           };
           break;
@@ -431,6 +466,20 @@ export function createServer(engine: LorexEngine): Server {
           };
           break;
         }
+        case "profile": {
+          const kind = args.kind === "user" ? "user" : "project";
+          const p = await engine.profile(kind, args.refresh === true);
+          receipt = {
+            op: "list" as const,
+            sources: [],
+            mode_used: "fast" as const,
+            token_cost: 0,
+            abstained: false,
+            summary: p ? `Profile (${p.kind}, ${p.cached ? "cached" : "fresh"}).` : "Profiles require the local backend.",
+            result: (p ?? {}) as Record<string, unknown>,
+          };
+          break;
+        }
         case "capture_session": {
           const parsed = CaptureSessionSchema.safeParse(args);
           if (!parsed.success) return badArgs(parsed.error.message);
@@ -483,14 +532,8 @@ export function createServer(engine: LorexEngine): Server {
         };
       }
       if (e instanceof HydraDBError) {
-        const hint =
-          e.kind === "auth"
-            ? "Check HYDRA_DB_API_KEY (run `lorex doctor`)."
-            : e.kind === "network" || e.kind === "server"
-              ? "HydraDB is unreachable or failing; this is transient."
-              : "";
         return {
-          content: [{ type: "text", text: `HydraDB ${e.kind} error: ${e.message}${hint ? ` ${hint}` : ""}` }],
+          content: [{ type: "text", text: `Store ${e.kind} error: ${e.message}` }],
           isError: true,
         };
       }

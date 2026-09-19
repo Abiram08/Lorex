@@ -42,7 +42,7 @@ async function main() {
   const dbPath = join(tmpDir, "bench.db");
   const store = new SqliteStore({ path: dbPath });
   const identity = resolveIdentity(process.cwd(), { workspace: "bench" });
-  const engine = new LorexEngine(store, identity, 500);
+  const engine = new LorexEngine(store, identity);
 
   await engine.ensureReady();
 

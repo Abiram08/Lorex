@@ -1,0 +1,1 @@
+{"description": "Local-first memory for coding agents. No login, no API key.", "name": "lorex-marketplace", "owner": {"name": "lorex"}, "plugins": [{"description": "Shared project memory that survives sessions: decisions, preferences, handoffs. Local SQLite, zero setup.", "name": "lorex", "source": "./plugin", "version": "0.3.0"}]}

@@ -27,7 +27,10 @@ a single SQLite file you can inspect, back up, copy, and delete.
 
 SQLite + FTS5 gives fast lexical search with stemming, WAL mode gives
 concurrent readers, prepared statements keep queries in single-digit
-milliseconds. No Docker, no Postgres, no vector database, no account.
+milliseconds. Point `LOREX_EMBED_URL` at Ollama (or any OpenAI-compatible
+endpoint) and search becomes hybrid: FTS + lifecycle + learned signals +
+vector similarity, with embeddings cached in the same file. No Docker, no
+Postgres, no vector database, no account.
 
 ```
 $ lorex add "Session storage moved to Redis because Atlas kept timing out"
@@ -99,7 +102,7 @@ Build order: CLI (for coding agents) → MCP → SDK → harness.
 ```
 Phase 1 (now):   local SQLite engine + lifecycle + dream + CLI
 Phase 2 (next):  harness — hooks as primary flow, CLI as debug surface
-Phase 3 (later): optional sync via write-queue replay
+Phase 3 (later): optional sync via export/import replay
 ```
 
 Design rules:
@@ -122,16 +125,94 @@ cross-agent handoff) builds on the same hook points.
 
 ## Quick start
 
+One command, nothing to install:
+
 ```bash
-npm install -g @lorex/cli
-lorex local     # start the HTTP memory API on 127.0.0.1:3777
-lorex wire      # write .mcp.json so Claude/Cursor/Windsurf pick up memory
-lorex hooks install --agent claude-code   # auto-load memory every session
-lorex doctor    # verifies setup with a smoke test
+npx @lorex/cli setup
 ```
 
-Node.js ≥ 20. No API key, no account, no network. Everything below runs
-offline against the bundled SQLite backend.
+Or paste this into your agent (Claude Code, Cursor, Codex, Windsurf) and
+it does the rest:
+
+> Set up Lorex memory for this project by running `npx @lorex/cli setup`
+
+Claude Code can also install the plugin directly:
+
+```
+/plugin marketplace add <your-lorex-repo-url>
+/plugin install lorex
+```
+
+Setup wires MCP + hooks + skill and verifies with a smoke test. No login.
+No API key. No account. Daily use is three commands: `add`, `ask`, `lorex`
+(status). Prefer a global install: `npm install -g @lorex/cli`, then
+`lorex setup`.
+
+## Local server
+
+```bash
+lorex local
+```
+
+Prints the endpoints, store path, and semantic status:
+
+```
+POST /add  | POST /v4/memories   store a fact or document
+POST /search | POST /v4/search   recall with answer + sources
+GET  /resume                     session-start pack
+GET  /profile[?kind=user]        standing state, no query needed
+GET  /health                     ok, workspace, agent
+```
+
+Bring your own models, fully offline:
+
+```bash
+# hybrid semantic search via local Ollama (nomic-embed-text default)
+LOREX_EMBED_URL=http://localhost:11434 lorex local
+
+# LLM extraction + synthesis via any OpenAI-compatible endpoint
+LOREX_LLM_BASE_URL=http://localhost:11434/v1 LOREX_LLM_API_KEY=ollama lorex local
+```
+
+Documents in, memories out — text, markdown, code, PDFs, URLs:
+
+```bash
+lorex learn --file ./runbook.md
+lorex learn --file ./architecture.pdf
+lorex learn --url https://example.com/spec
+```
+
+## Connecting agents
+
+`lorex setup` wires everything. Per-agent detail:
+
+| Agent | What setup writes | How memory flows |
+|---|---|---|
+| Claude Code | `.mcp.json` + `.claude/settings.json` hooks + skill, or `/plugin install lorex` | MCP tools + SessionStart/Stop/PreCompact hooks |
+| Codex | `~/.codex/config.toml` + `CODEX.md` | MCP tools + instruction guidance |
+| OpenCode | `opencode.json` + `AGENTS.md` | MCP tools + guidance |
+| Pi | `~/.pi/agent/mcp.json` + `AGENTS.md` | MCP tools + guidance |
+| OMP | `.omp/mcp.json` | MCP tools |
+| Aider | `AGENTS.md` conventions | Shell commands (`add`/`ask`/`resume`) — no MCP |
+| Cline | VSCode `cline_mcp_settings.json` + `.clinerules` | MCP tools + guidance |
+| Cursor / Windsurf / Gemini | available via `lorex hooks install --agent …` | MCP + hooks/rules |
+
+Check state with `lorex hooks status`, remove with `lorex hooks uninstall`.
+
+During setup you choose where memory lives (default `~/.lorex/`).
+Override any time with `LOREX_DATA_DIR` or `lorex setup --data-dir <path>`.
+
+## Shared memory
+
+Memory is shared per workspace on your machine — no login, no cloud:
+
+- **Same repo, any agent** — the collection derives from the git remote
+  hash, so clones of the same repo share memory while same-named repos
+  don't collide. Claude records at 2pm, Cursor reads at 3pm.
+- **User-level prefs** — `scope: global` visible from every project.
+- **Across machines** — `lorex export` / `lorex import` JSONL dumps.
+  Commit the dump to the repo (or sync it) and import on the other side.
+  Local rows win on conflict unless `--force`.
 
 ## Using it
 
@@ -153,8 +234,12 @@ lorex start     # MCP server over stdio
 | `list` | Snapshot of recent items |
 | `forget` | Soft-delete a fact topic (confidence-gated, history preserved) |
 | `report` | Send retrieval feedback — adjusts future ranking |
+| `dream` | Mine sessions for patterns, persist discoveries with derives edges |
+| `consolidate` | Apply expired TTLs, resolve corrections (opt-in prune/merge) |
+| `open_loops` | Unfinished work: tasks recorded but never acted on |
+| `profile` | Standing user/project state — no query needed |
 | `capture_session` | Ingest a full chat session through the pipeline |
-| `usage` | Show rate-limit consumption and pending write queue |
+| `usage` | Show rate-limit consumption |
 
 ### From the shell
 
@@ -197,7 +282,7 @@ lorex report --requestId req_abc --rating positive --sourceIds v1 v2
 lorex open-loops   # (via engine.openLoops / dashboard)
 ```
 
-## Shared memory across agents
+### Handoffs across agents
 
 Without a workspace, identity is derived from git — `database` is the user,
 `collection` is the repository — so agents share memory only when they run as
@@ -228,17 +313,16 @@ lorex remember --fact "Always respond with concise diffs" --scope global
 
 ## Storage
 
-Three backends implement `HydraDBLike`:
+Two backends implement the store contract:
 
 | Backend | When | Where |
 |---|---|---|
-| `SqliteStore` (**default**) | normal use — zero setup | `~/.lorex/local-store.db` |
-| `HydraDBClient` | `--cloud` + API key | remote API |
+| `SqliteStore` (**default**) | normal use — zero setup | `~/.lorex/local-store.db` (or your `--data-dir`) |
 | `MockHydraDB` | `--mock` | in-memory (tests, demos) |
 
 The SQLite schema: `memories` (facts + lifecycle columns), `relations`
-(supersedes/relates edges), `feedback` (ratings + ground truth),
-`query_failures` (recall-gap mining). FTS5 with porter stemming over text and
+(supersedes/extends/derives/relates edges), `feedback` (ratings + ground truth),
+`query_failures` (recall-gap mining), `profiles` (maintained standing state). FTS5 with porter stemming over text and
 fact keys, kept in sync by triggers. Old databases migrate automatically —
 new columns are added idempotently on open and the FTS index rebuilds.
 
@@ -253,8 +337,6 @@ Lorex is designed to run unattended inside agents that loop:
 - **Rate limiting** — persisted caps on writes/hour, writes/day, queries/hour,
   and ingest tokens/day. Configurable via environment variables; the MCP server
   tells the agent exactly how long to wait instead of failing opaquely.
-- **Durable write queue** — failed writes retry from `~/.lorex/queue.jsonl`
-  (30s auto-flush, 5 attempts), then dead-letter to a file rather than vanish.
 - **Graceful degradation** — backend failures during recall become
   `unavailable` abstentions, not crashes. Hook failures are fail-open.
 - **Soft deletes** — nothing is hard-deleted; forgetting closes validity
@@ -289,7 +371,7 @@ Agent  ──MCP/CLI/HTTP──▶  LorexEngine  ──▶  SQLite (memory + kno
                                ├── lifecycle (decay, TTL, consolidation, dream)
                                ├── feedback signals + correction learning
                                ├── abstention (claim withheld, evidence kept)
-                               ├── rate limiter + durable write queue
+                               ├── rate limiter + cross-process-safe writes
                                └── cross-agent attribution + handoffs
 ```
 
@@ -299,11 +381,11 @@ src/
                    graph · receipts
   ingestion/       normalizer → deduplicator → chunker → extractor → pipeline
                    session-capture · token-counter · language-packs
-  retrieval/       planner → hydradb-retriever → evidence-assembler
+  retrieval/       planner → store-retriever → evidence-assembler
   synthesis/       abstention · llm-synthesizer · verify
-  infrastructure/  sqlite-store (default) ⇄ hydradb-client ⇄ mock-hydradb
-                   lifecycle · dream · config · identity · limits
-                   rate-limiter · write-queue · errors · paths
+  infrastructure/  sqlite-store (default) · mock-hydradb (tests)
+                   lifecycle · dream · embeddings · config · identity · limits
+                   rate-limiter · secrets · errors · paths · store (contract)
   interfaces/      cli · mcp-server · local-server · agent-hooks · client
                    dashboard · graph-server · graph-render
   evaluation/      longmemeval harness
@@ -320,7 +402,7 @@ src/
 | `LOREX_AGENT` | Override the auto-detected agent name |
 | `LOREX_DATABASE` / `LOREX_COLLECTION` | Explicit identity, bypassing git derivation |
 | `LOREX_HOME` | Relocate all state; default `~/.lorex` |
-| `LOREX_QUEUE_CAP` | Write-queue capacity (default 500) |
+| `LOREX_DATA_DIR` | Relocate the memory store file |
 | `LOREX_MAX_WRITES_PER_HOUR` / `LOREX_MAX_WRITES_PER_DAY` | Rate-limit tuning |
 | `LOREX_MAX_QUERIES_PER_HOUR` | Rate-limit tuning |
 | `LOREX_MAX_INGEST_TOKENS_PER_DAY` | Daily ingestion budget |
@@ -329,8 +411,8 @@ src/
 | `LOREX_EXTRACT` | `llm` enables LLM fact extraction (heuristic by default) |
 | `LOREX_LLM_BASE_URL` / `LOREX_LLM_API_KEY` | OpenAI-compatible endpoint for opt-in synthesis/extraction |
 | `LOREX_SYNTH_MODEL` | Model for opt-in `recall` answer synthesis |
-| `HYDRA_DB_API_KEY` | Only needed for `--cloud` mode |
-| `HYDRADB_BASE_URL` / `HYDRADB_TIMEOUT_MS` | Cloud endpoint tuning |
+| `LOREX_EMBED_URL` / `LOREX_EMBED_MODEL` | Ollama (or OpenAI-compatible with `LOREX_EMBED_OPENAI=1`) endpoint for hybrid semantic search |
+| `LOREX_DATA_DIR` | Relocate the memory store file |
 | `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` / `GROQ_API_KEY` | Benchmark judge |
 | `LOREX_EVAL_MODEL` | Judge model override |
 
@@ -340,13 +422,15 @@ set in the environment. See [.env.example](.env.example).
 ## Development
 
 ```bash
-npm test                  # everything: 7 suites + capabilities + verify
+npm test                  # everything: 10 suites + capabilities + verify
 npm run test:core         # domain + engine unit tests
 npm run test:sqlite       # SQLite integration (incl. 10k stress test)
 npm run test:engine       # engine flows on real SQLite
 npm run test:retrieval    # planner + evidence packing
 npm run test:ingestion    # normalizer/chunker/dedup/extractor
 npm run test:server       # live HTTP server + client
+npm run test:hooks        # installers + setup/status CLI runs
+npm run test:embeddings   # vectors + hybrid rerank + PDF ingest
 npm run test:capabilities # 6 end-to-end capability checks
 npm run build
 npm run typecheck

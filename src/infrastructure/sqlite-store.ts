@@ -17,7 +17,7 @@ import type {
   FeedbackInput,
   HydraRelations,
   ContextScope,
-} from "./hydradb-client.js";
+} from "./store.js";
 import {
   memoryStrength,
   lifecycleScoreModifier,
@@ -26,6 +26,13 @@ import {
   type ConsolidationCandidate,
   type ConsolidationResult,
 } from "./lifecycle.js";
+import {
+  cosineSimilarity,
+  toBlob,
+  fromBlob,
+  providerFromEnv,
+  type EmbedProvider,
+} from "./embeddings.js";
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS memories (
@@ -93,6 +100,21 @@ const SCHEMA = `
     pattern    TEXT PRIMARY KEY,
     fails      INTEGER DEFAULT 1,
     last_at    TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS profiles (
+    collection TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    body       TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (collection, kind)
+  );
+
+  CREATE TABLE IF NOT EXISTS embeddings (
+    id     TEXT PRIMARY KEY,
+    model  TEXT NOT NULL,
+    dims   INTEGER NOT NULL,
+    vec    BLOB NOT NULL
   );
 `;
 
@@ -194,6 +216,8 @@ const SIGNAL_POSITIVE = 0.2;
 const SIGNAL_NEGATIVE = -0.3;
 /** Weight of signal in the final retrieval score. */
 const SIGNAL_WEIGHT = 0.15;
+/** Weight of semantic similarity in the final retrieval score. */
+const SEMANTIC_WEIGHT = 0.2;
 
 /** Extract explicit memory ids from feedback ground truth ({source_ids}). */
 function parseSignalIds(groundTruth: unknown): string[] {
@@ -255,6 +279,7 @@ export interface SqliteStoreOptions {
 export class SqliteStore implements HydraDBLike {
   private db: Database.Database;
   private schemaReady = false;
+  private embedder: EmbedProvider | null = null;
 
   private stmts = new Map<string, Database.Statement>();
 
@@ -267,6 +292,61 @@ export class SqliteStore implements HydraDBLike {
     this.db.pragma("synchronous = NORMAL");
     this.db.pragma("cache_size = -8000");
     this.db.pragma("busy_timeout = 5000");
+  }
+
+  /** Attach an embedding provider. Null disables semantic search (FTS only). */
+  setEmbedder(embedder: EmbedProvider | null): void {
+    this.embedder = embedder;
+  }
+
+  /** Embedder from env (LOREX_EMBED_URL), or null when unconfigured. */
+  autoEmbedder(): EmbedProvider | null {
+    if (!this.embedder) this.embedder = providerFromEnv();
+    return this.embedder;
+  }
+
+  /** Embed texts missing from the cache. Best-effort: never throws. */
+  private embedMissing(ids: string[], texts: string[]): void {
+    const embedder = this.embedder;
+    if (!embedder || !ids.length) return;
+    try {
+      const missingIdx: number[] = [];
+      const missingTexts: string[] = [];
+      for (let i = 0; i < ids.length; i++) {
+        const hit = this.prepared(`SELECT 1 FROM embeddings WHERE id = ? AND model = ?`).get(ids[i], embedder.model);
+        if (!hit) {
+          missingIdx.push(i);
+          missingTexts.push((texts[i] ?? "").slice(0, 2000));
+        }
+      }
+      if (!missingTexts.length) return;
+      // Fire and forget: embedding must never block ingestion.
+      void Promise.resolve()
+        .then(() => embedder.embed(missingTexts.slice(0, 50)))
+        .then((vecs) => {
+          const stmt = this.db.prepare(`INSERT OR REPLACE INTO embeddings (id, model, dims, vec) VALUES (?, ?, ?, ?)`);
+          const txn = this.db.transaction((rows: Array<{ id: string; vec: number[] }>) => {
+            for (const r of rows) stmt.run(r.id, embedder.model, r.vec.length, toBlob(r.vec));
+          });
+          txn(missingIdx.slice(0, vecs.length).map((idx, j) => ({ id: ids[idx]!, vec: vecs[j]! })));
+        })
+        .catch(() => undefined);
+    } catch { /* ignore */ }
+  }
+
+  /** Cosine similarity of a query vector against cached row vectors. */
+  private semanticScores(queryVec: number[], ids: string[]): Map<string, number> {
+    const out = new Map<string, number>();
+    if (!this.embedder) return out;
+    const rows = this.db.prepare(
+      `SELECT id, vec FROM embeddings WHERE model = ? AND id IN (${ids.map(() => "?").join(",")})`,
+    ).all(this.embedder.model, ...ids) as Array<{ id: string; vec: Buffer }>;
+    for (const r of rows) {
+      try {
+        out.set(r.id, cosineSimilarity(queryVec, fromBlob(r.vec)));
+      } catch { /* corrupt vector: skip */ }
+    }
+    return out;
   }
 
   private init(): void {
@@ -391,6 +471,8 @@ export class SqliteStore implements HydraDBLike {
       }
     })();
 
+    this.embedMissing(ids, input.memories.map((m) => m.text ?? ""));
+
     return { ids, ok: true, requestId: `req_${Date.now().toString(36)}` };
   }
 
@@ -412,6 +494,8 @@ export class SqliteStore implements HydraDBLike {
         ids.push(id);
       }
     })();
+
+    this.embedMissing(ids, (input.documents ?? []).map((d) => d.content?.text ?? d.content?.markdown ?? ""));
 
     return { ids, ok: true, requestId: `req_${Date.now().toString(36)}` };
   }
@@ -481,6 +565,22 @@ export class SqliteStore implements HydraDBLike {
 
     const rows = query ? this.searchFts(query, where, params, limit) : this.searchRecent(where, params, limit);
 
+    // Semantic rerank when an embedder is configured (best-effort, 2.5s cap).
+    let semantic = new Map<string, number>();
+    let semanticActive = false;
+    if (query && this.embedder && rows.length) {
+      try {
+        const vecs = await Promise.race([
+          this.embedder.embed([query.slice(0, 2000)]),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500)),
+        ]);
+        if (vecs[0]) {
+          semantic = this.semanticScores(vecs[0], rows.slice(0, 50).map((r) => r.id));
+          semanticActive = semantic.size > 0;
+        }
+      } catch { /* FTS scores stand alone */ }
+    }
+
     const scored = rows
       .map((r) => {
         const ftsScore = r.score < 0 ? normalizeFtsScore(r.score) : r.score;
@@ -489,7 +589,8 @@ export class SqliteStore implements HydraDBLike {
         );
         // FTS relevance + lifecycle strength + learned feedback signal
         const score = ftsScore * 0.7 + lifecycle * 0.3
-          + recencyBoost(r.valid_from) + (r.signal ?? 0) * SIGNAL_WEIGHT;
+          + recencyBoost(r.valid_from) + (r.signal ?? 0) * SIGNAL_WEIGHT
+          + (semantic.get(r.id) ?? 0) * SEMANTIC_WEIGHT;
         return { ...r, score, lifecycle_strength: lifecycle };
       })
       .sort((a, b) => b.score - a.score);
@@ -517,30 +618,31 @@ export class SqliteStore implements HydraDBLike {
       chunks.push(...this.expandRelations(chunks, collection, maxResults));
     }
 
-    return { chunks, requestId: `req_${Date.now().toString(36)}`, latencyMs: 0, raw: { engine: "sqlite", path: this.opts.path } };
+    return { chunks, requestId: `req_${Date.now().toString(36)}`, latencyMs: 0, raw: { engine: "sqlite", path: this.opts.path, semantic: semanticActive } };
   }
 
-  /** 1-hop relation expansion for thinking mode: linked memories at half score. */
+  /** 1-hop relation expansion for thinking mode, weighted by edge type. */
   private expandRelations(chunks: QueryChunk[], collection: string, maxResults: number): QueryChunk[] {
     const seen = new Set(chunks.map((c) => c.id));
     const out: QueryChunk[] = [];
     for (const chunk of chunks) {
       if (out.length + chunks.length >= maxResults) break;
       const linked = this.db.prepare(
-        `SELECT m.* FROM relations r
+        `SELECT m.*, r.type AS edge_type FROM relations r
          JOIN memories m ON m.id = CASE WHEN r.from_id = ? THEN r.to_id ELSE r.from_id END
          WHERE (r.from_id = ? OR r.to_id = ?) AND m.collection = ? AND m.status = 'current'
          LIMIT 3`,
-      ).all(chunk.id, chunk.id, chunk.id, collection) as Row[];
+      ).all(chunk.id, chunk.id, chunk.id, collection) as Array<Row & { edge_type: string }>;
       for (const row of linked) {
         if (seen.has(row.id)) continue;
         seen.add(row.id);
+        const weight = row.edge_type === "extends" ? 0.9 : row.edge_type === "derives" ? 0.8 : 0.5;
         let md: Record<string, unknown> = {};
         try { md = JSON.parse(row.metadata); } catch { /* ignore */ }
         out.push({
           id: row.id, text: row.text, content: row.text,
-          corpus: row.corpus as "memory" | "knowledge", score: (chunk.score ?? 0) * 0.5,
-          metadata: { ...md, fact_key: row.fact_key, via_relation: chunk.id },
+          corpus: row.corpus as "memory" | "knowledge", score: (chunk.score ?? 0) * weight,
+          metadata: { ...md, fact_key: row.fact_key, via_relation: chunk.id, edge_type: row.edge_type },
         });
       }
     }
@@ -741,6 +843,48 @@ export class SqliteStore implements HydraDBLike {
     })();
 
     return due.length;
+  }
+
+  /** Top memories of a type, ranked by strength. Powers profiles. */
+  topByType(collection: string, memoryType: string, limit = 10): Array<{ id: string; text: string; strength: number; created_at: string }> {
+    this.init();
+    return this.db.prepare(
+      `SELECT id, text, COALESCE(strength, 1.0) AS strength, created_at FROM memories
+       WHERE collection = ? AND status = 'current' AND memory_type = ?
+       ORDER BY strength DESC, access_count DESC LIMIT ?`,
+    ).all(collection, memoryType, limit) as Array<{ id: string; text: string; strength: number; created_at: string }>;
+  }
+
+  getProfile(collection: string, kind: string): { body: Record<string, unknown>; updated_at: string } | null {
+    this.init();
+    const row = this.db.prepare(`SELECT body, updated_at FROM profiles WHERE collection = ? AND kind = ?`)
+      .get(collection, kind) as { body: string; updated_at: string } | undefined;
+    if (!row) return null;
+    return { body: JSON.parse(row.body) as Record<string, unknown>, updated_at: row.updated_at };
+  }
+
+  saveProfile(collection: string, kind: string, body: Record<string, unknown>): void {
+    this.init();
+    this.prepared(
+      `INSERT INTO profiles (collection, kind, body, updated_at) VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(collection, kind) DO UPDATE SET body = excluded.body, updated_at = datetime('now')`,
+    ).run(collection, kind, JSON.stringify(body));
+  }
+
+  /** Exact newest-current lookup by fact key. No FTS involved. */
+  getCurrentByFactKey(collection: string, factKey: string): {
+    versionId: string; text: string; metadata: Record<string, unknown>;
+  } | null {
+    this.init();
+    const row = this.db.prepare(
+      `SELECT version_id, text, metadata FROM memories
+       WHERE collection = ? AND fact_key = ? AND status = 'current' AND valid_to IS NULL
+       ORDER BY valid_from DESC LIMIT 1`,
+    ).get(collection, factKey) as { version_id: string | null; text: string; metadata: string } | undefined;
+    if (!row) return null;
+    let md: Record<string, unknown> = {};
+    try { md = JSON.parse(row.metadata); } catch { /* ignore */ }
+    return { versionId: row.version_id ?? "", text: row.text, metadata: md };
   }
 
   /** Unfinished work: current tasks, never accessed, older than 7 days. */

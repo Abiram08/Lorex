@@ -18,7 +18,7 @@ function say(who: string, what: string): void {
 
 function agentEngine(client: MockHydraDB, agent: string): LorexEngine {
   const identity = resolveIdentity(process.cwd(), { workspace: WORKSPACE, agent });
-  return new LorexEngine(client, identity, 100);
+  return new LorexEngine(client, identity);
 }
 
 async function main(): Promise<void> {

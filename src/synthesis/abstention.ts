@@ -1,6 +1,6 @@
 /** Abstention policy: when the evidence does not support an answer. */
 
-import type { QueryChunk } from "../infrastructure/hydradb-client.js";
+import type { QueryChunk } from "../infrastructure/store.js";
 
 export type { AbstentionReason } from "../domain/receipts.js";
 import type { AbstentionReason } from "../domain/receipts.js";

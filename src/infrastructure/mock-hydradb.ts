@@ -1,4 +1,4 @@
-/** In-process HydraDB stand-in for offline demos, tests, and benchmarks. */
+/** In-process store for offline demos, tests, and benchmarks. */
 
 import {
   HydraDBLike,
@@ -11,7 +11,7 @@ import {
   FeedbackInput,
   MemoryItem,
   HydraRelations,
-} from "./hydradb-client.js";
+} from "./store.js";
 import { existsSync, readFileSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 

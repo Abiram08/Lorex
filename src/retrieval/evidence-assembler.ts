@@ -1,6 +1,6 @@
 /** Evidence ranking and packing under a token budget. */
 
-import type { QueryChunk } from "../infrastructure/hydradb-client.js";
+import type { QueryChunk } from "../infrastructure/store.js";
 import type { Evidence } from "../domain/evidence.js";
 import { excerpt } from "../domain/evidence.js";
 import { countTokens, truncateToTokenBudget } from "../ingestion/token-counter.js";

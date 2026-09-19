@@ -3,17 +3,52 @@
  * ingest into Lorex memory. Claude Code supported; other agents add parsers here.
  */
 
-import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { basename, join } from "node:path";
 import { homedir } from "node:os";
 import type { LorexEngine } from "../engine.js";
 import { normalizeSession } from "./normalizer.js";
+import { storeDir } from "../infrastructure/paths.js";
+import { loadConfig } from "../infrastructure/config.js";
 
 export interface CaptureOpts {
   transcriptPath: string;
   sessionId?: string;
   agent?: string;
   startedAt?: string;
+  /** Only ingest turns after the recorded cursor (auto path). Default false. */
+  incremental?: boolean;
+}
+
+/** Per-transcript cursor: how many turns were already ingested. */
+function cursorPath(): string {
+  let dataDir: string | undefined;
+  try {
+    dataDir = loadConfig().dataDir;
+  } catch { /* default location */ }
+  return join(storeDir(dataDir), "capture-cursors.json");
+}
+
+function readCursors(): Record<string, number> {
+  try {
+    if (!existsSync(cursorPath())) return {};
+    return JSON.parse(readFileSync(cursorPath(), "utf8")) as Record<string, number>;
+  } catch {
+    return {};
+  }
+}
+
+function writeCursor(transcriptPath: string, turns: number): void {
+  try {
+    let dataDir: string | undefined;
+    try {
+      dataDir = loadConfig().dataDir;
+    } catch { /* default location */ }
+    mkdirSync(storeDir(dataDir), { recursive: true });
+    const cursors = readCursors();
+    cursors[transcriptPath] = turns;
+    writeFileSync(cursorPath(), JSON.stringify(cursors));
+  } catch { /* cursor is best-effort; capture must not fail */ }
 }
 
 export interface CaptureResult {
@@ -95,8 +130,19 @@ export async function captureTranscript(engine: LorexEngine, opts: CaptureOpts):
 
   if (!existsSync(opts.transcriptPath)) return empty(opts.sessionId ?? basename(opts.transcriptPath), `Not found: ${opts.transcriptPath}`);
 
-  const turns = parseTranscript(readFileSync(opts.transcriptPath, "utf8"));
-  if (!turns.length) return empty(opts.sessionId ?? basename(opts.transcriptPath), "No turns in transcript");
+  const allTurns = parseTranscript(readFileSync(opts.transcriptPath, "utf8"));
+  if (!allTurns.length) return empty(opts.sessionId ?? basename(opts.transcriptPath), "No turns in transcript");
+
+  // Incremental: transcripts grow append-only, so skip turns already ingested.
+  const prior = opts.incremental ? (readCursors()[opts.transcriptPath] ?? 0) : 0;
+  const turns = allTurns.slice(Math.min(prior, allTurns.length));
+  if (!turns.length) {
+    return {
+      sessionId: opts.sessionId ?? basename(opts.transcriptPath, ".jsonl"),
+      chunkCount: 0, factCount: 0, tokenCount: 0, duplicateCount: 0,
+      errors: [], partial: false,
+    };
+  }
 
   const identity = engine.getIdentity();
   const sessionId = opts.sessionId ?? basename(opts.transcriptPath, ".jsonl");
@@ -108,6 +154,7 @@ export async function captureTranscript(engine: LorexEngine, opts: CaptureOpts):
   });
 
   const result = await engine.ingestSession(session);
+  writeCursor(opts.transcriptPath, allTurns.length);
   return {
     sessionId: result.sessionId,
     chunkCount: result.chunkCount,
@@ -160,7 +207,7 @@ export async function autoCaptureSession(engine: LorexEngine): Promise<CaptureRe
     } catch { continue; }
     if (!best || mtime > best.mtime) best = { path: found, agent, mtime };
   }
-  return best ? captureTranscript(engine, { transcriptPath: best.path, agent: best.agent }) : null;
+  return best ? captureTranscript(engine, { transcriptPath: best.path, agent: best.agent, incremental: true }) : null;
 }
 
 export async function autoCaptureClaudeSession(engine: LorexEngine): Promise<CaptureResult | null> {

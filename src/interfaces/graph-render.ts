@@ -157,7 +157,7 @@ export function renderGraphHtml(graph: ContextGraph, meta: RenderOptions): strin
   <div class="key"><span class="dot live"></span>current value</div>
   <div class="key"><span class="dot stale"></span>replaced</div>
   <div class="key"><span class="bar"></span>supersedes · with reason</div>
-  <div class="key"><span class="dot entity"></span>entity (HydraDB)</div>
+  <div class="key"><span class="dot entity"></span>entity</div>
   <div class="key"><span class="dot agent"></span>handoff</div>
   <div class="key"><span class="dot pack"></span>in retrieved pack</div>
 </div>

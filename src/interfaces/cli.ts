@@ -5,12 +5,11 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { loadConfig, saveConfig, configFile, type Config } from "../infrastructure/config.js";
-import { lorexHome } from "../infrastructure/paths.js";
+import { lorexHome, storeDbPath } from "../infrastructure/paths.js";
 import { resolveIdentity } from "../infrastructure/identity.js";
-import { HydraDBClient, type HydraDBLike } from "../infrastructure/hydradb-client.js";
+import { type HydraDBLike } from "../infrastructure/store.js";
 import { MockHydraDB } from "../infrastructure/mock-hydradb.js";
 import { SqliteStore } from "../infrastructure/sqlite-store.js";
-import { WriteQueue } from "../infrastructure/write-queue.js";
 import { LorexEngine } from "../engine.js";
 import { runStdioServer } from "./mcp-server.js";
 import { startDashboard } from "./dashboard.js";
@@ -56,6 +55,100 @@ function readJsonFile(path: string): Record<string, unknown> {
   }
 }
 
+/** One command: workspace + agent wiring + hooks + smoke test. */
+async function cmdSetup(args: string[]): Promise<void> {
+  const at = (name: string): string | undefined => {
+    const i = args.indexOf(name);
+    return i >= 0 ? args[i + 1] : undefined;
+  };
+  const cwd = process.cwd();
+  const config = loadConfig();
+  const workspace =
+    at("--workspace")?.trim() || config.workspace ||
+    basename(cwd).toLowerCase().replace(/[^a-z0-9]+/g, "-");
+
+  const nonInteractive = args.includes("--yes") || args.includes("-y") || !process.stdin.isTTY;
+  const currentDir = config.dataDir || storeDbPath();
+  let dataDir = at("--data-dir")?.trim() || config.dataDir || "";
+  if (!dataDir && !nonInteractive) {
+    const { createInterface } = await import("node:readline");
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      println(`  Where should memory live? (one SQLite file, yours forever)`);
+      const answer = await new Promise<string>((resolve) => {
+        rl.question(`  Data dir [${currentDir}]: `, (a) => resolve(a.trim()));
+      });
+      if (answer) dataDir = answer;
+    } finally {
+      rl.close();
+    }
+    println();
+  }
+  if (dataDir) {
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(dataDir, { recursive: true });
+  }
+  saveConfig({ workspace, ...(dataDir ? { dataDir } : {}) });
+
+  println(`Setting up Lorex for workspace "${workspace}"`);
+  println(`Memory lives at: ${storeDbPath(dataDir || undefined)}\n`);
+
+  println("[1/3] Wiring agents (MCP)…");
+  await cmdWire(at("--workspace") ? ["--workspace", at("--workspace")!] : []);
+
+  println("\n[2/3] Installing hooks (auto-load + auto-capture)…");
+  for (const agent of ["claude-code", "codex", "opencode", "pi", "omp", "aider", "cline"] as const) {
+    try {
+      const { path } = installHooks(agent, cwd);
+      println(`  [ok] ${agent} → ${path}`);
+    } catch (e) {
+      println(`  [skip] ${agent}: ${(e as Error).message}`);
+    }
+  }
+
+  println("\n[3/3] Smoke test…");
+  const client = new SqliteStore({ path: resolveLocalStorePath({ ...config, dataDir: dataDir || config.dataDir }) });
+  const engine = new LorexEngine(client, resolveIdentity(cwd, { workspace }));
+  await engine.ensureReady();
+  await engine.remember("Lorex setup verified", { id: "lorex_setup" });
+  const q = await engine.recall({ query: "setup verified", maxResults: 1 });
+  println(q.sources.length > 0 ? "  [ok] remember → recall round-trip works" : "  [warn] recall empty — retry in a few seconds");
+
+  println(`\nDone. Restart your agent — memory works from the next session.`);
+  println(`Daily use: lorex add "fact because reason" · lorex ask "question?" · lorex (status)`);
+}
+
+/** Bare `lorex`: what do I have, what's pending. */
+async function cmdStatus(args: string[]): Promise<void> {
+  const useMock = args.includes("--mock");
+  const config = useMock ? mockConfig() : loadConfig();
+  const identity = identityFrom(args, config);
+  const client = buildClient(useMock, config);
+
+  println(`Lorex status — ${identity.workspace ? `workspace "${identity.workspace}"` : `project "${identity.collectionLabel}"`} (agent: ${identity.agent})`);
+  println(`Memory lives at: ${resolveLocalStorePath(config)}`);
+
+  if (!(client instanceof SqliteStore)) {
+    println(`Backend: mock (detailed stats need the local store)`);
+    return;
+  }
+
+  const stats = client.getLifecycleStats(identity.collection);
+  const loops = client.getOpenLoops(identity.collection);
+  const handoffs = client.topByType(identity.collection, "handoff");
+  const profile = client.getProfile(identity.collection, "project");
+
+  const parts = Object.entries(stats.byType).map(([t, n]) => `${n} ${t}`);
+  println(`Memory: ${stats.total} facts${parts.length ? ` (${parts.join(", ")})` : ""} · avg strength ${stats.avgStrength.toFixed(2)}`);
+  if (stats.staleCount) println(`Stale: ${stats.staleCount} weak · ${stats.expiredCount} expired-validity`);
+  println(`Open loops: ${loops.length}${loops[0] ? ` — oldest: "${loops[0].text.slice(0, 80)}" (${loops[0].age_days}d)` : ""}`);
+  println(`Handoff: ${handoffs[0] ? `"${handoffs[0].text.slice(0, 100)}"` : "none recorded"}`);
+  println(`Profile: ${profile ? `fresh (${profile.updated_at.slice(0, 10)})` : "not built yet — run lorex profile"}`);
+
+  const wired = existsSync(join(process.cwd(), ".mcp.json"));
+  println(`Agent wiring: ${wired ? ".mcp.json present" : "not wired — run lorex setup"}`);
+}
+
 /** Connect this project to coding agents. Writes configs instead of printing snippets. */
 async function cmdWire(args: string[]): Promise<void> {
   const at = (name: string): string | undefined => {
@@ -80,9 +173,13 @@ async function cmdWire(args: string[]): Promise<void> {
     const mcpPath = join(cwd, ".mcp.json");
     const existing = readJsonFile(mcpPath);
     const servers = (existing.mcpServers ?? {}) as Record<string, unknown>;
-    servers.lorex = { command: "lorex", args: ["start"] };
+    const { lorexBin } = await import("./agent-hooks.js");
+    const bin = lorexBin();
+    servers.lorex = bin === "lorex"
+      ? { command: "lorex", args: ["start"] }
+      : { command: "npx", args: ["-y", "@lorex/cli", "start"] };
     existing.mcpServers = servers;
-    writeFileSync(mcpPath, JSON.stringify(existing, null, 2) + "\n");
+    writeFileSync(mcpPath, JSON.stringify(existing, null) + "\n");
     done.push(`MCP: ${mcpPath} (Claude Code, Cursor, Windsurf)`);
   }
 
@@ -91,7 +188,11 @@ async function cmdWire(args: string[]): Promise<void> {
     mkdirSync(join(homedir(), ".codex"), { recursive: true });
     const current = existsSync(codexPath) ? readFileSync(codexPath, "utf8") : "";
     if (!current.includes("mcp_servers.lorex")) {
-      const block = `[mcp_servers.lorex]\ncommand = "lorex"\nargs = ["start"]\n`;
+      const { lorexBin: codexBin } = await import("./agent-hooks.js");
+      const codexCmd = codexBin();
+      const block = codexCmd === "lorex"
+        ? `[mcp_servers.lorex]\ncommand = "lorex"\nargs = ["start"]\n`
+        : `[mcp_servers.lorex]\ncommand = "npx"\nargs = ["-y", "@lorex/cli", "start"]\n`;
       writeFileSync(codexPath, current + (current.endsWith("\n") || !current ? "" : "\n") + block);
       done.push(`MCP: ${codexPath} (Codex)`);
     } else {
@@ -107,18 +208,44 @@ async function cmdWire(args: string[]): Promise<void> {
 /** Install agent lifecycle hooks so memory loads without being asked. */
 async function cmdHooks(args: string[]): Promise<void> {
   const sub = args[0] ?? "install";
-  if (sub !== "install") {
-    println('Usage: lorex hooks install [--agent claude-code|cursor|windsurf|codex]');
-    return;
-  }
   const at = (name: string): string | undefined => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
   };
+
+  if (sub === "status") {
+    const { hooksStatus } = await import("./agent-hooks.js");
+    for (const s of hooksStatus(process.cwd())) {
+      println(`  ${s.configured ? "[ok]" : "[--]"} ${s.agent}: ${s.detail}`);
+    }
+    return;
+  }
+
+  if (sub === "uninstall") {
+    const { uninstallHooks, isAgentSupported: supported } = await import("./agent-hooks.js");
+    const only = at("--agent");
+    const agents = only ? [only] : ["claude-code", "codex", "opencode", "pi", "omp", "aider", "cline", "cursor", "windsurf", "gemini"];
+    for (const agent of agents) {
+      if (!supported(agent)) {
+        println(`Unknown agent: "${agent}". Supported: claude-code, codex, opencode, pi, omp, aider, cline, cursor, windsurf, gemini`);
+        process.exitCode = 1;
+        return;
+      }
+      const { path, removed } = uninstallHooks(agent, process.cwd());
+      println(removed ? `  [ok] ${agent}: removed from ${path}` : `  [--] ${agent}: nothing to remove (${path})`);
+    }
+    println("Note: MCP wiring (.mcp.json) is separate — delete the lorex block to fully detach.");
+    return;
+  }
+
+  if (sub !== "install") {
+    println('Usage: lorex hooks [install|status|uninstall] [--agent claude-code|cursor|windsurf|codex|opencode|gemini|cline|aider]');
+    return;
+  }
   const agent = at("--agent") ?? "claude-code";
 
   if (!isAgentSupported(agent)) {
-    println(`Unknown agent: "${agent}". Supported: claude-code, cursor, windsurf, codex`);
+    println(`Unknown agent: "${agent}". Supported: claude-code, cursor, windsurf, codex, opencode, gemini, cline, aider`);
     process.exitCode = 1;
     return;
   }
@@ -134,98 +261,41 @@ async function cmdInit(argv: string[] = []): Promise<void> {
     return i >= 0 ? argv[i + 1] : undefined;
   };
   const nonInteractive = argv.includes("--yes") || argv.includes("-y") || !process.stdin.isTTY;
-  const cliWorkspace = flag("--workspace");
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     println(BANNER);
     println("  Lorex — local-first memory for coding agents.");
     println(`  Memory home: ${lorexHome()}`);
-    if (nonInteractive) println("  (non-interactive — taking defaults, pass --workspace to name it)");
-    println();
-
-    let existing: Config | null = null;
-    try {
-      existing = loadConfig();
-    } catch {
-      existing = null;
-    }
-
-    println("  Step 1 of 2 — Name your workspace");
-    println("  Every agent that names the same workspace reads and writes the same");
-    println("  memory. Stored once, so you never pass --workspace again.");
     println();
 
     const suggestion = basename(process.cwd()).toLowerCase().replace(/[^a-z0-9]+/g, "-");
     const workspace =
-      cliWorkspace?.trim() ||
+      flag("--workspace")?.trim() ||
       (nonInteractive ? suggestion : (await prompt(rl, `  Workspace [${suggestion}]: `)) || suggestion);
 
-    println();
-    println("  Step 2 of 2 — Cloud sync (optional)");
-    println("  Blank = local-only. Everything works offline in ~/.lorex/.");
-    println();
-
-    let apiKey = existing?.apiKey ?? "";
-    // `--yes` = fastest setup: verify locally, never probe network, never wipe
-    // a stored key. Pass --cloud to verify cloud, --local to drop the key.
-    const wantCloudSetup = argv.includes("--cloud");
-    const dropKey = argv.includes("--local");
-    if (dropKey) apiKey = "";
-    const verifyCloud = wantCloudSetup && apiKey.trim() !== "";
-    if (apiKey && !dropKey) {
-      println(`  A key is already configured (…${apiKey.slice(-4)}).`);
-      if (nonInteractive) {
-        println("  Keeping it (--local to drop it).");
-      } else {
-        const replace = await prompt(rl, "  Replace it? [y/N] ");
-        if (replace.toLowerCase().startsWith("y")) apiKey = "";
-      }
-    }
-    if (!apiKey && !argv.includes("--local")) {
-      apiKey = nonInteractive
-        ? ""
-        : await prompt(rl, "  HydraDB API key [blank = local-only]: ");
-      if (!apiKey) {
-        println("\n  Staying local-only. Run `lorex init` again any time to add cloud sync.\n");
-      }
-    } else if (argv.includes("--local")) {
-      apiKey = "";
+    const defaultDir = storeDbPath();
+    const dataDir =
+      flag("--data-dir")?.trim() ||
+      (nonInteractive ? "" : await prompt(rl, `  Data dir [${defaultDir}]: `));
+    if (dataDir) {
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(dataDir, { recursive: true });
     }
 
-    const baseUrl =
-      (nonInteractive ? "" : await prompt(rl, "  Base URL [https://api.hydradb.com]: ")) || "https://api.hydradb.com";
-
-    saveConfig({ apiKey, baseUrl, workspace });
+    saveConfig({ workspace, ...(dataDir ? { dataDir } : {}) });
     println();
     println(`  Saved to ${configFile()} (owner-readable only).`);
+    println(`  Memory lives at: ${storeDbPath(dataDir || undefined)}`);
 
     println();
     println("  Verifying…");
-    if (!verifyCloud) {
-      const verifyClient = new MockHydraDB({ persistPath: resolveLocalStorePath() });
-      const verifyIdentity = resolveIdentity(process.cwd(), { workspace });
-      const verifyEngine = new LorexEngine(verifyClient, verifyIdentity, 500);
-      await verifyEngine.ensureReady();
-      const probe = await verifyEngine.recall({ query: "smoke", maxResults: 1 });
-      void probe;
-      println(`  [ok] Local store ready (${resolveLocalStorePath()}). No network needed.`);
-    } else {
-      const client = new HydraDBClient({ apiKey, baseUrl, timeoutMs: 8_000, queueCap: 500 });
-      const probe = await Promise.race([
-        client.ping(slugWorkspace(workspace)),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
-      ]);
-
-      if (!probe) {
-        println("  [??] No response within 20s. Setup is saved; run `lorex doctor` to retry.");
-      } else if (probe.authed && probe.reachable) {
-        println(`  [ok] HydraDB reachable and authenticated (${probe.latencyMs}ms).`);
-      } else if (!probe.authed) {
-        println("  [!!] Key rejected. Check it and run `lorex init` again.");
-      } else {
-        println(`  [!!] Could not reach ${baseUrl}: ${probe.error ?? "unknown error"}`);
-      }
-    }
+    const verifyClient = new SqliteStore({ path: storeDbPath(dataDir || undefined) });
+    const verifyIdentity = resolveIdentity(process.cwd(), { workspace });
+    const verifyEngine = new LorexEngine(verifyClient, verifyIdentity);
+    await verifyEngine.ensureReady();
+    const probe = await verifyEngine.recall({ query: "smoke", maxResults: 1 });
+    void probe;
+    println(`  [ok] Local store ready. No network needed.`);
 
     println();
     println("  Connect your agents — Lorex runs as an MCP server:");
@@ -246,10 +316,6 @@ async function cmdInit(argv: string[] = []): Promise<void> {
   }
 }
 
-function slugWorkspace(input: string): string {
-  return `ws_${input.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")}`;
-}
-
 function identityFrom(args: string[], config: Config) {
   const at = (name: string): string | undefined => {
     const i = args.indexOf(name);
@@ -265,23 +331,18 @@ function identityFrom(args: string[], config: Config) {
   });
 }
 
-function resolveLocalStorePath(): string {
-  const next = join(lorexHome(), "local-store.db");
-  return next;
+function resolveLocalStorePath(config?: Config): string {
+  return storeDbPath(config?.dataDir);
 }
 
 function buildClient(useMock: boolean, config: Config): HydraDBLike {
-  // Local-first: SQLite is the default. Cloud (HydraDB) is opt-in only
-  // when a key is configured AND --cloud is passed. --mock falls back to JSON.
-  const wantsCloud = !useMock && (config.apiKey?.trim() ?? "") !== "" && process.argv.includes("--cloud");
-  const wantsMock = useMock && !process.argv.includes("--sqlite");
-  if (wantsCloud) {
-    return new HydraDBClient(config);
-  }
-  if (wantsMock) {
+  // SQLite is the store. --mock falls back to the in-memory JSON backend.
+  if (useMock && !process.argv.includes("--sqlite")) {
     return new MockHydraDB({ persistPath: join(lorexHome(), "mock-store.json") });
   }
-  return new SqliteStore({ path: resolveLocalStorePath() });
+  const store = new SqliteStore({ path: resolveLocalStorePath(config) });
+  store.autoEmbedder();
+  return store;
 }
 
 async function cmdStart(args: string[]): Promise<void> {
@@ -292,12 +353,7 @@ async function cmdStart(args: string[]): Promise<void> {
     process.stderr.write(`lorex: ${identity.warning}\n`);
   }
   const client = buildClient(useMock, config);
-  const engine = new LorexEngine(client, identity, config.queueCap);
-  const shutdown = (): void => {
-    void engine.queue.flush().finally(() => process.exit(0));
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  const engine = new LorexEngine(client, identity);
   await runStdioServer(engine);
 }
 
@@ -306,25 +362,22 @@ async function cmdUsage(args: string[]): Promise<void> {
   const config = useMock ? mockConfig() : loadConfig();
   const identity = identityFrom(args, config);
   const client = buildClient(useMock, config);
-  const engine = new LorexEngine(client, identity, config.queueCap);
+  const engine = new LorexEngine(client, identity);
   const u = engine.usage;
   println("Lorex usage (this project)\n==========================");
   println(`Writes:      ${u.writesThisHour}/${u.limits.writesPerHour} this hour · ${u.writesToday}/${u.limits.writesPerDay} today`);
   println(`Queries:     ${u.queriesThisHour}/${u.limits.queriesPerHour} this hour`);
   println(`Ingested:    ${u.ingestTokensToday}/${u.limits.ingestTokensPerDay} tokens today`);
-  println(`Write queue: ${engine.queueLength} pending`);
   println("\nAdjust via LOREX_MAX_WRITES_PER_HOUR, LOREX_MAX_WRITES_PER_DAY,");
   println("LOREX_MAX_QUERIES_PER_HOUR, LOREX_MAX_INGEST_TOKENS_PER_DAY env vars.");
 }
 
 async function cmdDoctor(args: string[]): Promise<void> {
   const useMock = args.includes("--mock");
-  const wantCloud = args.includes("--cloud");
   println("Lorex doctor\n=============\n");
   const config = useMock ? mockConfig() : loadConfig();
-  const local = !wantCloud || (config.apiKey?.trim() ?? "") === "";
-  println(`[ok] mode — ${local ? "local (no network)" : `cloud via ${config.baseUrl}`}`);
-  if (local) println(`     store: ${resolveLocalStorePath()}`);
+  println(`[ok] mode — local (no network)`);
+  println(`     store: ${resolveLocalStorePath(config)}`);
 
   const identity = identityFrom(args, config);
   println(`[ok] identity — database=${identity.databaseLabel} collection=${identity.collectionLabel}`);
@@ -339,11 +392,8 @@ async function cmdDoctor(args: string[]): Promise<void> {
   const client = buildClient(useMock, config);
   println("[ok] client — initialized");
 
-  const queue = new WriteQueue(client, config.queueCap);
-  println(`[ok] write queue — ${queue.pending().length} pending (cap ${config.queueCap})`);
-
   println("\nSmoke test:");
-  const engine = new LorexEngine(client, identity, config.queueCap);
+  const engine = new LorexEngine(client, identity);
   await engine.ensureReady();
 
   const r1 = await engine.remember("Lorex local memory is working", {
@@ -371,7 +421,7 @@ async function cmdLocal(args: string[]): Promise<void> {
   const config = loadConfig();
   const identity = identityFrom(args, config);
   const client = buildClient(false, config);
-  const engine = new LorexEngine(client, identity, config.queueCap);
+  const engine = new LorexEngine(client, identity);
   const at = (name: string): string | undefined => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
@@ -381,11 +431,16 @@ async function cmdLocal(args: string[]): Promise<void> {
     host: at("--host") ?? "127.0.0.1",
     port: at("--port") ? Number(at("--port")) : 3777,
   });
+  const semantic = process.env.LOREX_EMBED_URL?.trim()
+    ? `semantic: on (${process.env.LOREX_EMBED_MODEL?.trim() || "nomic-embed-text"})`
+    : "semantic: off (FTS only — set LOREX_EMBED_URL to enable)";
   println(`Lorex local memory API running at ${url}`);
+  println(`  store:    ${resolveLocalStorePath(config)}`);
+  println(`  memory:   ${semantic}`);
   println(`  POST ${url}/add     {"text": "fact because reason"}`);
   println(`  POST ${url}/search  {"query": "what changed?"}`);
-  println(`  GET  ${url}/resume`);
-  println("  No setup needed — data lives in ~/.lorex/. Press Ctrl+C to stop.\n");
+  println(`  GET  ${url}/resume / GET /health / GET /profile`);
+  println("  No setup needed — data lives on your machine. Press Ctrl+C to stop.\n");
   await new Promise(() => undefined); // run until killed
 }
 
@@ -395,7 +450,7 @@ async function cmdDashboard(args: string[]): Promise<void> {
   const config = useMock ? mockConfig() : loadConfig();
   const identity = identityFrom(args, config);
   const client = buildClient(useMock, config);
-  const engine = new LorexEngine(client, identity, config.queueCap);
+  const engine = new LorexEngine(client, identity);
   await engine.ensureReady();
 
   const at = (name: string): string | undefined => {
@@ -414,7 +469,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
   const config = useMock ? mockConfig() : loadConfig();
   const identity = identityFrom(args, config);
   const client = buildClient(useMock, config);
-  const engine = new LorexEngine(client, identity, config.queueCap);
+  const engine = new LorexEngine(client, identity);
 
   const flag = (name: string): string | undefined => {
     const i = args.indexOf(name);
@@ -422,12 +477,23 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
   };
 
   // Simple positional: `lorex add "text"` / `lorex ask "question"` — join
-  // non-flag args so quoting is optional.
+  // non-flag args so quoting is optional. Only value-flags consume the next arg.
+  const VALUE_FLAGS = new Set([
+    "--fact", "--query", "--id", "--because", "--validFrom", "--validTo",
+    "--sourceRef", "--ttl", "--scope", "--relation", "--workspace", "--agent",
+    "--file", "--in", "--out", "--transcript", "--sessionId", "--startedAt",
+    "--next", "--decision", "--requestId", "--answer", "--rating", "--feedback",
+    "--sourceIds", "--maxResults", "--maxTokens", "--mode", "--type", "--asOf",
+    "--data-dir", "--host", "--port", "--kind", "--collection",
+  ]);
   const firstPositional = (() => {
     const parts: string[] = [];
     for (let i = 0; i < args.length; i++) {
       const a = args[i]!;
-      if (a.startsWith("--")) { i++; continue; }
+      if (a.startsWith("--")) {
+        if (VALUE_FLAGS.has(a)) i++;
+        continue;
+      }
       parts.push(a);
     }
     const joined = parts.join(" ").trim();
@@ -439,7 +505,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
     case "add":
     case "remember": {
       const fact = flag("--fact") ?? firstPositional;
-      if (!fact) return println(JSON.stringify({ error: 'Usage: lorex add "fact because reason" [--id id] [--because reason]' }));
+      if (!fact) return println(JSON.stringify({ error: '--fact is required. Usage: lorex add "fact because reason" [--id id] [--because reason]' }));
       receipt = await engine.remember(fact, {
         validFrom: flag("--validFrom"),
         id: flag("--id"),
@@ -447,6 +513,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         ttlSeconds: flag("--ttl") ? Number(flag("--ttl")) : undefined,
         because: flag("--because"),
         scope: flag("--scope") === "global" ? "global" : undefined,
+        relation: flag("--relation") === "extends" ? "extends" : flag("--relation") === "supersedes" ? "supersedes" : undefined,
       });
       break;
     }
@@ -475,7 +542,18 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
     }
     case "learn": {
       const content = flag("--content");
-      if (!content) return println(JSON.stringify({ error: "--content required" }));
+      const file = flag("--file");
+      const url = flag("--url");
+      if (file ?? url) {
+        const result = await engine.ingestDocument({ path: file, url });
+        println(JSON.stringify({
+          op: "ingest-document",
+          ...result,
+          summary: `Ingested document: ${result.chunkCount} chunks, ${result.factCount} facts`,
+        }, null));
+        return;
+      }
+      if (!content) return println(JSON.stringify({ error: "--content, --file, or --url required" }));
       receipt = await engine.learn(content, flag("--sourceRef"));
       break;
     }
@@ -542,7 +620,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
           stats: graph.stats,
           summary: `Wrote ${out} - ${graph.nodes.length} nodes, ${graph.edges.length} edges, ` +
             `${graph.stats.explainedChanges}/${graph.stats.totalChanges} changes with a recorded reason.`,
-        }, null, 2));
+        }, null));
         return;
       }
 
@@ -584,7 +662,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         edges: graph.edges.length,
         summary: `Published snapshot with data baked in (read-only, no credentials). ` +
           `Copy ${pubDir} to your static host (e.g. \`npx wrangler pages deploy ${pubDir}\` or \`gh-pages\`).`,
-      }, null, 2));
+      }, null));
       return;
     }
     case "why": {
@@ -617,7 +695,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         summary: `Dream found ${r.discovered.length} patterns, persisted ${r.persisted}, ` +
           `reinforced ${r.reinforced.length}, flagged ${r.contradictions.length} contradictions.`,
         result: r,
-      }, null, 2));
+      }, null));
       return;
     }
     case "consolidate": {
@@ -627,7 +705,7 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         ...r,
         summary: `Consolidation: ${r.expired} expired applied` +
           (args.includes("--prune") ? `, ${r.pruned} pruned, ${r.merged} merged` : `, ${r.planned - r.expired} more pending (pass --prune to apply)`),
-      }, null, 2));
+      }, null));
       return;
     }
     case "open-loops": {
@@ -637,6 +715,23 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
         return;
       }
       for (const l of loops) println(`- [${l.age_days}d] ${l.text} (${l.id})`);
+      return;
+    }
+    case "profile": {
+      const kind = flag("--kind") === "user" ? "user" : "project";
+      const p = await engine.profile(kind, args.includes("--refresh"));
+      if (!p) return println(JSON.stringify({ error: "profiles require the local SQLite backend" }));
+      if (args.includes("--plain")) {
+        const lines = [`Profile (${p.kind}, ${p.cached ? "cached" : "fresh"}):`];
+        for (const pref of p.preferences.slice(0, 5)) lines.push(`- prefers: ${pref.text}`);
+        for (const d of p.decisions.slice(0, 5)) lines.push(`- decided: ${d.text}`);
+        for (const c of p.constraints.slice(0, 5)) lines.push(`- constraint: ${c}`);
+        for (const l of p.openLoops.slice(0, 5)) lines.push(`- open: ${l.text}`);
+        if (p.lastHandoff) lines.push(`- handoff: ${p.lastHandoff.decision}`);
+        println(lines.join("\n"));
+        return;
+      }
+      println(JSON.stringify({ op: "profile", ...p }, null));
       return;
     }
     case "export": {
@@ -738,17 +833,13 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
       return println(JSON.stringify({ error: `Unknown command: ${op}` }));
   }
 
-  println(JSON.stringify(receipt, null, 2));
+  println(JSON.stringify(receipt, null));
 }
 
-function mockConfig() {
+function mockConfig(): Config {
   return {
-    apiKey: "mock",
-    baseUrl: "http://mock.local",
-    timeoutMs: 5000,
-    queueCap: 500,
-    databaseOverride: undefined as string | undefined,
-    collectionOverride: undefined as string | undefined,
+    databaseOverride: undefined,
+    collectionOverride: undefined,
   };
 }
 
@@ -779,10 +870,12 @@ function prompt(rl: ReturnType<typeof createInterface>, q: string): Promise<stri
 }
 
 export async function runCli(argv: string[]): Promise<void> {
-  const cmd = argv[0] ?? "help";
+  const cmd = argv[0] ?? "status";
   const rest = argv.slice(1);
 
   switch (cmd) {
+    case "setup": return cmdSetup(rest);
+    case "status": return cmdStatus(rest);
     case "init": return cmdInit(rest);
     case "local": return cmdLocal(rest);
     case "wire": return cmdWire(rest);
@@ -808,6 +901,7 @@ export async function runCli(argv: string[]): Promise<void> {
     case "dream": return cmdOneShot("dream", rest);
     case "consolidate": return cmdOneShot("consolidate", rest);
     case "open-loops": return cmdOneShot("open-loops", rest);
+    case "profile": return cmdOneShot("profile", rest);
     case "export": return cmdOneShot("export", rest);
     case "import": return cmdOneShot("import", rest);
     case "help":
@@ -824,19 +918,32 @@ export async function runCli(argv: string[]): Promise<void> {
 
 const USAGE = `Lorex — local-first memory for coding agents.
 
-Zero setup (Supermemory-local style, no init needed):
+Start here (1 command, nothing to install):
+  npx @lorex/cli setup
+
+Or paste this into your agent and it does the rest:
+  "Set up Lorex memory for this project by running npx @lorex/cli setup"
+
+Daily use (3 commands):
+  lorex add "fact because reason"   (or: npx @lorex/cli add "...")
+  lorex ask "question?"
+  lorex                             status: memory, loops, handoff, wiring
+
+Zero setup (no init needed):
   lorex local                   start the memory API on http://127.0.0.1:3777
   lorex wire                    connect this project to your agents (writes .mcp.json)
-  lorex hooks install           agents auto-load memory every session
+  lorex hooks install [--agent ...]  agents auto-load memory every session
+  lorex hooks status                 which agents have Lorex wired
+  lorex hooks uninstall [--agent …]  remove Lorex from agent configs
   lorex add "fact because reason"
   lorex ask "question?"
 
 Usage:
   lorex init [--workspace name] [--yes] [--local]   setup (workspace saved, key optional)
-  lorex start [--cloud]     Start MCP server (local store by default)
-  lorex doctor [--cloud]    Verify setup (fast local smoke test)
-  lorex usage [--cloud]     Show rate-limit usage and queue status
-  lorex dashboard [--cloud] Local dashboard on 127.0.0.1:3000 (--port to change)
+  lorex start               Start MCP server (local store)
+  lorex doctor              Verify setup (fast local smoke test)
+  lorex usage               Show rate-limit usage
+  lorex dashboard           Local dashboard on 127.0.0.1:3000 (--port to change)
 
 Simple (human output):
   lorex add "Session storage moved to Redis because Atlas timed out"
@@ -851,6 +958,7 @@ Full (JSON):
   lorex graph --live [--port 4100]             Live graph that redraws as agents write
   lorex handoff --decision "..." [--next "..."] Hand work to the next agent
   lorex learn --content "..." [--sourceRef ref]
+  lorex learn --file ./runbook.md | --url https://…
   lorex history [--factId id] [--query "..."]
   lorex list [--type memory|knowledge|all]
   lorex resume
@@ -859,11 +967,13 @@ Full (JSON):
   lorex dream                               Mine sessions for patterns, persist discoveries
   lorex consolidate [--prune]               Apply expired TTLs (and, with --prune, merges)
   lorex open-loops                          Tasks recorded but never acted on
+  lorex profile [--kind user|project] [--refresh] [--plain]
+                                            Standing state, no retrieval needed
   lorex export [--collection c] [--out f]   Dump memories as JSONL (backup, git, sync)
   lorex import --file f [--force]           Merge a dump (local wins unless --force)
   lorex capture --sessionId id --file turns.json [--startedAt ISO]
 
-All commands run local-first (no key needed). Add --cloud to use HydraDB sync when configured.
+All commands run local-first (no key needed).
 
 Shared memory across agents:
   --workspace <name>   Join a shared workspace. Every agent naming the same

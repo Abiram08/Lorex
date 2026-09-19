@@ -27,6 +27,16 @@ export interface HealthResult {
   agent?: string;
 }
 
+export interface ProfileResult {
+  collection?: string;
+  kind?: string;
+  cached?: boolean;
+  preferences?: Array<{ text: string; strength: number }>;
+  decisions?: Array<{ text: string; created_at: string }>;
+  constraints?: string[];
+  openLoops?: Array<{ text: string; age_days: number }>;
+}
+
 export class LorexError extends Error {
   constructor(public readonly status: number, message: string) {
     super(message);
@@ -64,5 +74,10 @@ export class Lorex {
 
   async health(): Promise<HealthResult> {
     return this.request<HealthResult>("GET", "/health");
+  }
+
+  /** Standing profile, no query needed. */
+  async profile(kind: "user" | "project" = "project"): Promise<ProfileResult> {
+    return this.request<ProfileResult>("GET", `/profile?kind=${kind}`);
   }
 }

@@ -1,6 +1,6 @@
 /** Dream: background pattern extraction from session history. Heuristic, no LLM needed. */
 
-import type { HydraDBLike, QueryChunk } from "./hydradb-client.js";
+import type { HydraDBLike, QueryChunk } from "./store.js";
 import {
   planConsolidation,
   type ConsolidationCandidate,
@@ -20,6 +20,7 @@ export interface DreamMemory {
   memoryType: "preference" | "lesson" | "pattern";
   confidence: number;
   source: "frequency" | "temporal" | "correction" | "contradiction";
+  sourceIds: string[];
 }
 
 export interface DreamContradiction {
@@ -97,6 +98,7 @@ export async function dreamHeuristic(
       memoryType: "preference",
       confidence,
       source: "frequency",
+      sourceIds: group.map((c) => c.id),
     });
   }
 
@@ -117,6 +119,7 @@ export async function dreamHeuristic(
         memoryType: "lesson",
         confidence: 0.7,
         source: "temporal",
+        sourceIds: group.map((c) => c.id),
       });
     }
   }
@@ -167,6 +170,7 @@ export async function dreamHeuristic(
         memoryType: "lesson",
         confidence: Math.min(0.9, 0.5 + f.fails * 0.05),
         source: "contradiction",
+        sourceIds: [],
       });
     }
   }

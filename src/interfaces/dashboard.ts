@@ -128,7 +128,7 @@ function buildHtml(activeView: string = "overview"): string {
 <body>
   <div class="header">
     <h1>Lorex Dashboard</h1>
-    <div class="subtitle">HydraDB-powered temporal context layer</div>
+    <div class="subtitle">Local-first temporal context layer</div>
     <div class="token-badge">Dashboard token: <span id="token-display">${escapeHtml(dashboardToken?.slice(0, 8) ?? "...")}</span>...</div>
   </div>
 
@@ -151,7 +151,6 @@ function buildHtml(activeView: string = "overview"): string {
         <div class="stat-grid">
           <div class="stat"><div class="label">Memories (recent)</div><div class="value" id="memory-count">—</div></div>
           <div class="stat"><div class="label">Knowledge (recent)</div><div class="value" id="knowledge-count">—</div></div>
-          <div class="stat"><div class="label">Queue State</div><div class="value" id="queue-state">—</div></div>
           <div class="stat"><div class="label">Requests Today</div><div class="value" id="requests-today">—</div></div>
         </div>
       </div>
@@ -258,7 +257,6 @@ function buildHtml(activeView: string = "overview"): string {
         const data = await api("overview");
         document.getElementById("memory-count").textContent = data.memoryCount ?? "?";
         document.getElementById("knowledge-count").textContent = data.knowledgeCount ?? "?";
-        document.getElementById("queue-state").textContent = data.queueState ?? "unknown";
         document.getElementById("requests-today").textContent = data.requestCount ?? 0;
 
         const log = document.getElementById("recent-log");
@@ -369,11 +367,9 @@ async function handleApi(state: DashboardState, path: string, params: URLSearchP
       } catch {
         // Store unreachable — leave counts at zero rather than failing the view.
       }
-      const pending = state.engine.queueLength;
       return new Response(JSON.stringify({
         memoryCount,
         knowledgeCount,
-        queueState: pending > 0 ? `${pending} pending` : "idle",
         requestCount: state.requestLog.length,
         recentRequests: state.requestLog.slice(-20).reverse(),
       }), { headers: { "Content-Type": "application/json" } });

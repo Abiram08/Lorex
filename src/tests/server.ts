@@ -14,7 +14,7 @@ import { Lorex, LorexError } from "../client.js";
 
 const dir = mkdtempSync(join(tmpdir(), "lorex-srv-test-"));
 const store = new SqliteStore({ path: join(dir, "test.db") });
-const engine = new LorexEngine(store, resolveIdentity(dir, { collection: "srv" }), 1000);
+const engine = new LorexEngine(store, resolveIdentity(dir, { collection: "srv" }));
 
 const { url, stop } = await serveLocal(engine, { port: 0 });
 const client = new Lorex(url);
@@ -64,6 +64,14 @@ try {
   {
     const r = await client.resume();
     assert.ok(typeof r.summary === "string" || typeof r.answer === "string", "resume returns a pack");
+  }
+
+  // ── Profile ──────────────────────────────────────────────────────────────
+  {
+    await client.add("Profile probe prefers TypeScript for new services");
+    const p = await client.profile();
+    assert.ok(p.preferences && p.preferences.length >= 0, "profile returns preferences array");
+    assert.ok(typeof p.cached === "boolean", "profile reports cache state");
   }
 
   // ── Validation errors ────────────────────────────────────────────────────

@@ -50,8 +50,7 @@ function normalizeReason(raw: string): string {
     .slice(0, 200);
 }
 
-export function extractTransition(text: string): { from?: string; to?: string } {
-  const m = text.match(
+export function extractTransition(text: string): { from?: string; to?: string } {  const m = text.match(
     /\b(?:switch(?:ed|ing)?|migrat(?:ed|ing)|mov(?:ed|ing)|chang(?:ed|ing))\s+from\s+([\w.+#-]{2,40})\s+to\s+([\w.+#-]{2,40})/i,
   );
   if (m) return { from: m[1], to: m[2] };
@@ -64,8 +63,23 @@ export function extractTransition(text: string): { from?: string; to?: string } 
   return {};
 }
 
-export function renderCausalChain(chain: CausalChain): string {
-  if (chain.links.length === 0) return "No recorded changes for this topic.";
+const ADDITIVE_MARKERS =
+  /\b(also|additionally|plus|in addition|as well|on top of|besides|furthermore|alongside)\b/i;
+const REPLACEMENT_MARKERS =
+  /\b(instead of|rather than|replac(?:e[sd]?|ing)|no longer|stop(?:ped|ping)? using|moved? (?:from|to)|switch(?:ed|ing)?|migrat(?:ed|ing)|wrong|incorrect|fix(?:ed|ing)?)\b/i;
+
+/**
+ * Additive update vs replacement: "we also use X" extends the topic,
+ * "we switched to X" supersedes it. Replacement markers and explicit
+ * transitions always win over additive markers.
+ */
+export function detectExtension(text: string, hasTransition: boolean): boolean {
+  if (hasTransition) return false;
+  if (REPLACEMENT_MARKERS.test(text)) return false;
+  return ADDITIVE_MARKERS.test(text);
+}
+
+export function renderCausalChain(chain: CausalChain): string {  if (chain.links.length === 0) return "No recorded changes for this topic.";
 
   const lines: string[] = [];
   const ordered = [...chain.links].sort(

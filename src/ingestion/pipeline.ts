@@ -1,6 +1,6 @@
 /** Session ingestion pipeline and cross-session supersession linking. */
 
-import type { HydraDBLike, MemoryItem, IngestKnowledgeInput } from "../infrastructure/hydradb-client.js";
+import type { HydraDBLike, MemoryItem, IngestKnowledgeInput } from "../infrastructure/store.js";
 import type { NormalizedSession } from "../domain/session.js";
 import { sessionToEvents } from "./normalizer.js";
 import { chunkEvents, DEFAULT_CHUNK_TOKENS, type Chunk } from "./chunker.js";
@@ -9,6 +9,10 @@ import { extractFacts, extractFactsWithLlm, llmExtractionEnabled, type Extracted
 import { extractReason, extractTransition } from "../domain/causality.js";
 import { LIMITS, assertMaxLength } from "../infrastructure/limits.js";
 import { METADATA_SCHEMA_VERSION } from "../domain/receipts.js";
+import { redactSecrets } from "../infrastructure/secrets.js";
+
+/** Backstop confidence floor; the extractor filters harder upstream. */
+const MIN_PIPELINE_CONFIDENCE = 0.3;
 
 export type FactIndex = Map<string, { versionId: string; validFrom: string; text: string; metadata: Record<string, unknown> }>;
 
@@ -121,7 +125,7 @@ async function storeChunks(
     const batch = chunks.slice(i, i + batchSize);
     const documents = batch.map((chunk) => ({
       id: chunk.chunkId,
-      content: { text: chunk.content },
+      content: { text: redactSecrets(chunk.content).text },
       additional_metadata: {
         schema_version: METADATA_SCHEMA_VERSION,
         session_id: chunk.sessionId,
@@ -161,6 +165,8 @@ async function storeFacts(
   const items: MemoryItem[] = [];
 
   for (const fact of ordered) {
+    if (fact.confidence < MIN_PIPELINE_CONFIDENCE) continue;
+    const value = redactSecrets(fact.value).text;
     const versionId = `${fact.factKey}_${fact.sessionId}_${fact.eventId}`;
     const prior = index?.get(fact.factKey);
     const supersedes =
@@ -182,8 +188,8 @@ async function storeFacts(
       });
     }
 
-    const reason = extractReason(fact.value);
-    const transition = extractTransition(fact.value);
+    const reason = extractReason(value);
+    const transition = extractTransition(value);
     const metadata: Record<string, unknown> = {
       schema_version: METADATA_SCHEMA_VERSION,
       fact_key: fact.factKey,
@@ -209,7 +215,7 @@ async function storeFacts(
 
     items.push({
       id: versionId,
-      text: fact.value,
+      text: value,
       infer: true,
       relations: supersedes
         ? { ids: [supersedes.versionId], properties: { type: "supersedes", reason: reason ?? null } }
@@ -223,7 +229,7 @@ async function storeFacts(
         index.set(fact.factKey, {
           versionId,
           validFrom: fact.occurredAt,
-          text: fact.value,
+          text: value,
           metadata,
         });
       }

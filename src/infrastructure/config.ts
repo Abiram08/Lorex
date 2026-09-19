@@ -5,14 +5,11 @@ import { join } from "node:path";
 import { lorexHome } from "./paths.js";
 
 export interface Config {
-  /** Empty = local-first mode (SQLite/JSON store, no network). Set only for cloud sync. */
-  apiKey: string;
-  baseUrl: string;
-  timeoutMs: number;
-  queueCap: number;
   databaseOverride?: string;
   collectionOverride?: string;
   workspace?: string;
+  /** Where memory lives. Empty = lorex home. Set via `lorex setup` or LOREX_DATA_DIR. */
+  dataDir?: string;
 }
 
 export function configFile(): string {
@@ -20,13 +17,10 @@ export function configFile(): string {
 }
 
 interface StoredConfig {
-  apiKey?: string;
-  baseUrl?: string;
-  timeoutMs?: number;
-  queueCap?: number;
   database?: string;
   collection?: string;
   workspace?: string;
+  dataDir?: string;
 }
 
 function loadDotEnv(cwd: string): Record<string, string> {
@@ -82,14 +76,10 @@ export function saveConfig(cfg: Partial<StoredConfig>): void {
 }
 
 const STORED_KEY_FOR_ENV: Record<string, keyof StoredConfig> = {
-  HYDRA_DB_API_KEY: "apiKey",
-  HYDRADB_API_KEY: "apiKey",
-  HYDRADB_BASE_URL: "baseUrl",
-  HYDRADB_TIMEOUT_MS: "timeoutMs",
-  LOREX_QUEUE_CAP: "queueCap",
   LOREX_DATABASE: "database",
   LOREX_COLLECTION: "collection",
   LOREX_WORKSPACE: "workspace",
+  LOREX_DATA_DIR: "dataDir",
 };
 
 export function loadConfig(cwd = process.cwd()): Config {
@@ -105,21 +95,10 @@ export function loadConfig(cwd = process.cwd()): Config {
   const env = (k: string): string | undefined =>
     process.env[k] ?? dotenv[k] ?? fromStore(k);
 
-  const apiKey = (env("HYDRA_DB_API_KEY") ?? env("HYDRADB_API_KEY") ?? "").trim();
-  // Local-first: no key = local store. Cloud sync is opt-in via `lorex init`
-  // or setting HYDRA_DB_API_KEY. Never throw here.
-
-  const baseUrl = (env("HYDRADB_BASE_URL") ?? "https://api.hydradb.com").trim();
-  const timeoutMs = Number(env("HYDRADB_TIMEOUT_MS") ?? 15000) || 15000;
-  const queueCap = Number(env("LOREX_QUEUE_CAP") ?? 500) || 500;
-
   return {
-    apiKey,
-    baseUrl: baseUrl.replace(/\/+$/, ""),
-    timeoutMs,
-    queueCap,
     databaseOverride: env("LOREX_DATABASE") || undefined,
     collectionOverride: env("LOREX_COLLECTION") || undefined,
     workspace: env("LOREX_WORKSPACE") || undefined,
+    dataDir: env("LOREX_DATA_DIR") || undefined,
   };
 }

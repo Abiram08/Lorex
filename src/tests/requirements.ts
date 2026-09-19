@@ -23,7 +23,7 @@ const identity = resolveIdentity(process.cwd(), {
   collection: "demo",
 });
 const client = new MockHydraDB();
-const engine = new LorexEngine(client, identity, 500);
+const engine = new LorexEngine(client, identity);
 await engine.ensureReady();
 
 console.log("1️⃣  REQUIREMENT: Process 30–40 sessions\n");
@@ -102,7 +102,7 @@ const recall = await engine.recall({
 
 const ctx = recall.token_cost;
 const pct = recall.compression?.context_pct ?? (ctx / haystack) * 100;
-const ratio = recall.compression?.compression_ratio ?? haystack / Math.max(ctx, 1);
+const ratio = recall.compression?.compression_ratio ?? haystack / Math.max(ctx);
 
 console.log(`   Context pack: ${ctx.toLocaleString()} tokens`);
 console.log(`   Compression:  ${pct.toFixed(2)}% of haystack (${ratio.toFixed(0)}× smaller)`);

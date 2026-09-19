@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { classifyAndPlan } from "../retrieval/planner.js";
 import { assembleEvidence, synthesizeTimeline, synthesizeAnswer } from "../retrieval/evidence-assembler.js";
-import type { QueryChunk } from "../infrastructure/hydradb-client.js";
+import type { QueryChunk } from "../infrastructure/store.js";
 
 function chunk(id: string, text: string, corpus: "memory" | "knowledge" = "memory", score = 0.8, meta: Record<string, unknown> = {}): QueryChunk {
   return { id, text, content: text, corpus, score, metadata: { valid_from: "2024-01-01T00:00:00Z", ...meta } };

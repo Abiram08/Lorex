@@ -97,7 +97,7 @@ const mcpResult = await new Promise((resolve) => {
 const s = mcpResult.seen;
 ok("initialize returns a result", !!s.init?.result, s.init ? undefined : "no response");
 ok("server identifies itself as lorex", s.init?.result?.serverInfo?.name === "lorex");
-ok("tools/list returns 12 tools", s.tools?.result?.tools?.length === 12, `got ${s.tools?.result?.tools?.length}`);
+ok("tools/list returns 16 tools", s.tools?.result?.tools?.length === 16, `got ${s.tools?.result?.tools?.length}`);
 ok("tools/call remember succeeds", s.remember?.result && !s.remember.result.isError);
 ok("tools/call recall succeeds", s.recall?.result && !s.recall.result.isError);
 const recallText = s.recall?.result?.content?.[1]?.text ?? "";
