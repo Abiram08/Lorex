@@ -1,0 +1,37 @@
+node_modules/
+dist/
+!website/dist/
+!website/dist/**
+.env
+*.log
+.DS_Store
+Thumbs.db
+.local-queue/
+longmemeval-out/
+data/
+lorex-graph.html
+verify-graph.html
+longmemeval-*results*.json
+*.progress.jsonl
+*.tsbuildinfo
+.mcp.json
+.tmp-npm-cache/
+*.tgz
+
+# Local agent / dev tooling (except the distributable Lorex skill)
+.commandcode/
+.agents/
+!.agents/
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/lorex/
+!.agents/skills/lorex/SKILL.md
+skills-lock.json
+.claude-plugin/
+.idea/
+.vscode/
+
+# Kept local by choice (not published)
+VISION.md
+plan.md
