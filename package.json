@@ -1,0 +1,81 @@
+{
+  "name": "@lorex/cli",
+  "version": "0.3.0",
+  "description": "Local-first memory for coding agents: temporal, causal, evidence-backed project memory with lifecycle, consolidation, and dream. SQLite by default.",
+  "author": "Abiram08",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Abiram08/Lorex.git"
+  },
+  "homepage": "https://github.com/Abiram08/Lorex#readme",
+  "bugs": {
+    "url": "https://github.com/Abiram08/Lorex/issues"
+  },
+  "type": "module",
+  "bin": {
+    "lorex": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc --noEmit",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run release:check",
+    "start": "node dist/index.js start",
+    "dev": "tsx src/index.ts",
+    "init": "node dist/index.js init",
+    "doctor": "node dist/index.js doctor",
+    "test": "npm run test:core && npm run test:sqlite && npm run test:engine && npm run test:retrieval && npm run test:ingestion && npm run test:harness && npm run test:hooks && npm run test:task && npm run test:embeddings && npm run test:capabilities && npm run test:infra && npm run test:daemon && npm run verify",
+    "test:core": "tsx src/tests/core.ts",
+    "test:sqlite": "tsx src/tests/sqlite.ts",
+    "test:engine": "tsx src/tests/engine-sqlite.ts",
+    "test:retrieval": "tsx src/tests/retrieval.ts",
+    "test:ingestion": "tsx src/tests/ingestion.ts",
+    "test:harness": "tsx src/tests/harness.ts",
+    "test:hooks": "tsx src/tests/hooks.ts",
+    "test:task": "tsx src/tests/task-context.ts",
+    "test:embeddings": "tsx src/tests/embeddings.ts",
+    "test:capabilities": "tsx src/tests/requirements.ts",
+    "test:infra": "tsx src/tests/infrastructure.ts",
+    "test:daemon": "tsx src/tests/daemon.ts",
+    "test:package": "npm run build && node scripts/package-smoke.mjs",
+    "audit:prod": "npm audit --omit=dev --audit-level=high",
+    "release:check": "npm run audit:prod && npm run typecheck && npm run build && npm test && npm run test:package",
+    "build:all": "tsc",
+    "pretest": "node scripts/clean-temp.mjs",
+    "posttest": "node scripts/clean-temp.mjs --all",
+    "verify": "npm run build && node scripts/verify.mjs"
+  },
+  "files": [
+    "dist",
+    "console",
+    ".agents/skills/lorex/SKILL.md",
+    "README.md"
+  ],
+  "keywords": [
+    "mcp",
+    "agent-memory",
+    "context",
+    "local-first",
+    "sqlite",
+    "retrieval"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "better-sqlite3": "^13.0.3",
+    "js-tiktoken": "^1.0.21",
+    "pdf-parse": "^2.4.5",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3"
+  }
+}
