@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lorex — Local console</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<aside class="sidebar" aria-label="Main navigation">
+  <div class="brand"><span class="logo" aria-hidden="true">◈</span><span>Lorex<small>LOCAL CONSOLE</small></span></div>
+  <nav id="nav" aria-label="Console sections">
+    <span class="nav-label">WORKSPACE</span>
+    <button data-page="home" class="active">Overview</button>
+    <button data-page="memories">Memories</button>
+    <button data-page="knowledge">Knowledge</button>
+    <button data-page="spaces">Spaces</button>
+    <button data-page="graph">Graph</button>
+    <span class="nav-label">SYSTEM</span>
+    <button data-page="learner">Health</button>
+    <button data-page="connections">Connections</button>
+    <button data-page="api">Local API</button>
+    <button data-page="settings">Settings</button>
+  </nav>
+  <div class="side-foot" id="side-status" role="status">Connecting…</div>
+</aside>
+<main>
+  <header class="topbar"><span class="eyebrow">YOUR MEMORY, ON THIS MACHINE</span><span class="topbar-status"><i aria-hidden="true"></i> Local service</span></header>
+  <section id="page-home" class="page active"><div class="loading">Loading…</div></section>
+  <section id="page-memories" class="page"><div class="loading">Loading…</div></section>
+  <section id="page-knowledge" class="page"><div class="loading">Loading…</div></section>
+  <section id="page-spaces" class="page"><div class="loading">Loading…</div></section>
+  <section id="page-learner" class="page"><div class="loading">Loading…</div></section>
+  <section id="page-graph" class="page"><iframe id="graph-frame" title="Context graph" src="/graph"></iframe></section>
+  <section id="page-connections" class="page"><div class="loading">Loading…</div></section>
+  <section id="page-api" class="page"><div class="loading">Loading…</div></section>
+  <section id="page-settings" class="page"><div class="loading">Loading…</div></section>
+</main>
+<div id="toast" role="status" aria-live="polite"></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>
