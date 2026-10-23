@@ -67,7 +67,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.32.2",
-    "better-sqlite3": "^13.0.3",
+    "better-sqlite3": "^12.5.0",
     "js-tiktoken": "^1.0.21",
     "pdf-parse": "^2.4.5",
     "zod": "^4.6.7"
