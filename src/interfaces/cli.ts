@@ -13,7 +13,8 @@ import { MockHydraDB } from "../infrastructure/mock-hydradb.js";
 import { SqliteStore } from "../infrastructure/sqlite-store.js";
 import { LorexEngine } from "../engine.js";
 import { runStdioServer } from "./mcp-server.js";
-import { agentHome, installHooks, isAgentSupported, lorexBin } from "./agent-hooks.js";
+import { agentHome, coreAgentConnections, installHooks, isAgentSupported } from "./agent-hooks.js";
+import { ensureDurableLorexCommand, lorexCommand, lorexMcpCommand } from "../infrastructure/runtime-command.js";
 import { liveDaemon } from "../daemon/lock.js";
 import { detectLocalModels, type LocalModels } from "../infrastructure/local-models.js";
 import { VERSION } from "../infrastructure/version.js";
@@ -54,7 +55,7 @@ const BANNER = String.raw`
 
 const AGENT_SETUP: Array<{ name: string; file: string; snippet: (ws: string) => string }> = [
   {
-    name: "Claude Code / Cursor / Windsurf",
+    name: "Claude Code",
     file: ".mcp.json in your project root",
     // Workspace auto-resolves from stored config — plain `lorex start` is enough.
     snippet: (_ws) =>
@@ -71,6 +72,17 @@ const AGENT_SETUP: Array<{ name: string; file: string; snippet: (ws: string) => 
       `[mcp_servers.lorex]\ncommand = "lorex"\nargs = ["start"]`,
   },
 ];
+
+function upsertTomlSection(text: string, section: string, block: string): string {
+  const header = `[${section}]`;
+  const start = text.split(/\r?\n/).findIndex((line) => line.trim() === header);
+  if (start < 0) return text + (text && !text.endsWith("\n") ? "\n" : "") + block;
+  const lines = text.split(/\r?\n/);
+  let end = start + 1;
+  while (end < lines.length && !/^\s*\[[^\]]+\]\s*$/.test(lines[end] ?? "")) end++;
+  const replacement = block.replace(/\n$/, "").split("\n");
+  return [...lines.slice(0, start), ...replacement, ...lines.slice(end)].join("\n").replace(/\n*$/, "\n");
+}
 
 function readJsonFile(path: string): Record<string, unknown> {
   if (!existsSync(path)) return {};
@@ -99,7 +111,7 @@ async function cmdSetup(args: string[]): Promise<void> {
     defaultWorkspace(cwd);
 
   const nonInteractive = args.includes("--yes") || args.includes("-y") || !process.stdin.isTTY;
-  const currentDir = config.dataDir || storeDbPath();
+  const currentDir = config.dataDir || lorexHome();
   let dataDir = at("--data-dir")?.trim() || config.dataDir || "";
   if (!dataDir && !nonInteractive) {
     const { createInterface } = await import("node:readline");
@@ -122,13 +134,30 @@ async function cmdSetup(args: string[]): Promise<void> {
   saveProjectWorkspace(workspace, cwd);
   if (dataDir) saveConfig({ dataDir });
 
+  let runtime;
+  try {
+    runtime = ensureDurableLorexCommand();
+  } catch (error) {
+    process.exitCode = 1;
+    println(`[fail] Runtime: ${(error as Error).message}`);
+    return;
+  }
+
   println(`Setting up Lorex for workspace "${workspace}"`);
+  println(`Runtime: ${runtime.source === "managed-runtime" ? runtime.args[0] : runtime.command} (offline-safe)`);
   println(`Memory lives at: ${storeDbPath(dataDir || undefined)}\n`);
 
   println("[1/3] Wiring agents (MCP)…");
-  await cmdWire(["--agent", "all", "--workspace", workspace]);
+  try {
+    await cmdWire(["--agent", "all", "--workspace", workspace]);
+  } catch (error) {
+    process.exitCode = 1;
+    println(`  [fail] MCP wiring: ${(error as Error).message}`);
+    println("  Repair the named configuration file without deleting unrelated settings, then run lorex again.");
+    return;
+  }
 
-  println("\n[2/3] Installing hooks (auto-load + auto-capture)…");
+  println("\n[2/3] Installing agent hooks and guidance…");
   const requiredFailures: string[] = [];
   // Keep one-command setup useful across the supported local coding agents.
   for (const agent of ["claude-code", "codex", "cursor", "opencode", "grok"] as const) {
@@ -144,22 +173,42 @@ async function cmdSetup(args: string[]): Promise<void> {
   }
 
   println("\n[3/3] Smoke test…");
-  const client = new SqliteStore({ path: resolveLocalStorePath({ ...config, dataDir: dataDir || config.dataDir }) });
-  const engine = new LorexEngine(client, resolveIdentity(cwd, { workspace }));
+  const storePath = resolveLocalStorePath({ ...config, dataDir: dataDir || config.dataDir });
+  const client = new SqliteStore({ path: storePath });
+  const secondClient = new SqliteStore({ path: storePath });
+  const engine = new LorexEngine(client, resolveIdentity(cwd, { workspace, agent: "claude-code" }));
+  const second = new LorexEngine(secondClient, resolveIdentity(cwd, { workspace, agent: "opencode" }));
   await engine.ensureReady();
-  await engine.remember("Lorex setup verified", { id: "lorex_setup" });
+  await engine.remember("Lorex setup verified", { id: "lorex_setup", agent: "claude-code" });
   const q = await engine.recall({ query: "setup verified", maxResults: 1 });
+  const shared = await second.recall({ query: "setup verified", maxResults: 1 });
+  client.close();
+  secondClient.close();
   println(q.sources.length > 0 ? "  [ok] remember → recall round-trip works" : "  [warn] recall empty — retry in a few seconds");
 
-  if (requiredFailures.length || !q.sources.length) {
+  // This verifies store/collection sharing with independent clients and agent
+  // attribution. It does not pretend that a real external agent fired a hook.
+  const sharedSource = shared.sources.find((source) => source.content.includes("Lorex setup verified"));
+  const sharedOk = sharedSource?.agent === "claude-code";
+  println(sharedOk
+    ? "  [ok] shared store works: OpenCode identity recalled a Claude Code source"
+    : "  [warn] shared store or source attribution failed across agent identities");
+
+  const connections = coreAgentConnections(cwd);
+  println("\nConfigured agent bridges:");
+  for (const connection of connections) {
+    println(`  ${connection.configured ? "[ok]" : "[fail]"} ${connection.label}: ${connection.capabilities.join(" · ") || "not configured"}`);
+    if (!connection.configured && connection.action) println(`       ${connection.action}`);
+  }
+  const connectionFailures = connections.filter((connection) => !connection.configured).map((connection) => connection.label);
+  if (requiredFailures.length || connectionFailures.length || !q.sources.length || !sharedOk) {
     process.exitCode = 1;
-    println(`\nSetup incomplete: ${requiredFailures.length ? `required hooks failed (${requiredFailures.join(", ")})` : "memory smoke test failed"}. Run lorex doctor after fixing this.`);
+    const failures = [...new Set([...requiredFailures, ...connectionFailures])];
+    println(`\nSetup incomplete: ${failures.length ? `agent bridges failed (${failures.join(", ")})` : "shared memory smoke test failed"}. Run lorex doctor after fixing this.`);
     return;
   }
-  println(`\nDone. Restart your agent — memory works from the next session.`);
-  if (lorexBin().startsWith("npx")) {
-    println(`Note: this was a one-shot npx setup, so hooks may need npm cache/network. For offline hooks: npm install -g @lorex/cli && lorex setup`);
-  }
+  println(`\nDone. Restart agents and complete any trust step shown above.`);
+  println("Configuration is verified; real agent hook execution must still be confirmed with a completed turn.");
   println(`Daily use: lorex add "fact because reason" · lorex ask "question?" · lorex (status)`);
 }
 
@@ -172,6 +221,8 @@ async function cmdStatus(args: string[]): Promise<void> {
 
   println(`Lorex status — ${identity.workspace ? `workspace "${identity.workspace}"` : `project "${identity.collectionLabel}"`} (agent: ${identity.agent})`);
   println(`Memory lives at: ${resolveLocalStorePath(config)}`);
+  const runtime = lorexCommand();
+  println(`Runtime: ${runtime.durable ? "offline-safe" : "temporary"} (${runtime.source})`);
   if (config.activeTask) println(`Active shared task: ${config.activeTask}`);
 
   if (!(client instanceof SqliteStore)) {
@@ -191,8 +242,11 @@ async function cmdStatus(args: string[]): Promise<void> {
   println(`Handoff: ${handoffs[0] ? `"${handoffs[0].text.slice(0, 100)}"` : "none recorded"}`);
   println(`Profile: ${profile ? `fresh (${profile.updated_at.slice(0, 10)})` : "not built yet — run lorex profile"}`);
 
-  const wired = existsSync(join(process.cwd(), ".mcp.json"));
-  println(`Agent wiring: ${wired ? ".mcp.json present" : "not wired — run lorex setup"}`);
+  println("Agent bridges (configured files; not proof that an external agent fired a hook):");
+  for (const connection of coreAgentConnections(projectRoot())) {
+    println(`  ${connection.configured ? "[ok]" : "[!!]"} ${connection.label}: ${connection.capabilities.join(" · ") || connection.detail}`);
+    if (connection.action) println(`       ${connection.action}`);
+  }
 }
 
 /** A scoped, append-only brief and progress stream for simultaneous agents. */
@@ -241,6 +295,7 @@ async function cmdTask(args: string[]): Promise<void> {
 
 /** Connect this project to coding agents. Writes configs instead of printing snippets. */
 async function cmdWire(args: string[]): Promise<void> {
+  ensureDurableLorexCommand();
   const at = (name: string): string | undefined => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
@@ -256,21 +311,17 @@ async function cmdWire(args: string[]): Promise<void> {
   saveProjectWorkspace(workspace, cwd);
 
   const done: string[] = [];
-  const wantFileAgents = !only || only === "all" || ["claude", "cursor", "windsurf"].includes(only);
+  const wantFileAgents = !only || only === "all" || ["claude", "windsurf"].includes(only);
   const wantCodex = only === "all" || only === "codex";
 
   if (wantFileAgents) {
     const mcpPath = join(cwd, ".mcp.json");
     const existing = readJsonFile(mcpPath);
     const servers = (existing.mcpServers ?? {}) as Record<string, unknown>;
-    const { lorexBin } = await import("./agent-hooks.js");
-    const bin = lorexBin();
-    servers.lorex = bin === "lorex"
-      ? { command: "lorex", args: ["start"] }
-      : { command: "npx", args: ["-y", "@lorex/cli", "start"] };
+    servers.lorex = lorexMcpCommand("claude-code");
     existing.mcpServers = servers;
     writeFileSync(mcpPath, JSON.stringify(existing, null) + "\n");
-    done.push(`MCP: ${mcpPath} (Claude Code, Cursor, Windsurf)`);
+    done.push(`MCP: ${mcpPath} (Claude Code)`);
   }
 
   if (!only || only === "all" || only === "cursor") {
@@ -278,10 +329,7 @@ async function cmdWire(args: string[]): Promise<void> {
     mkdirSync(join(cwd, ".cursor"), { recursive: true });
     const existing = readJsonFile(cursorPath);
     const servers = (existing.mcpServers ?? {}) as Record<string, unknown>;
-    const { lorexBin } = await import("./agent-hooks.js");
-    servers.lorex = lorexBin() === "lorex"
-      ? { command: "lorex", args: ["start"] }
-      : { command: "npx", args: ["-y", "@lorex/cli", "start"] };
+    servers.lorex = lorexMcpCommand("cursor");
     existing.mcpServers = servers;
     writeFileSync(cursorPath, JSON.stringify(existing, null, 2) + "\n");
     done.push(`MCP: ${cursorPath} (Cursor)`);
@@ -291,17 +339,11 @@ async function cmdWire(args: string[]): Promise<void> {
     const codexPath = join(agentHome(), ".codex", "config.toml");
     mkdirSync(join(agentHome(), ".codex"), { recursive: true });
     const current = existsSync(codexPath) ? readFileSync(codexPath, "utf8") : "";
-    if (!current.includes("mcp_servers.lorex")) {
-      const { lorexBin: codexBin } = await import("./agent-hooks.js");
-      const codexCmd = codexBin();
-      const block = codexCmd === "lorex"
-        ? `[mcp_servers.lorex]\ncommand = "lorex"\nargs = ["start"]\n`
-        : `[mcp_servers.lorex]\ncommand = "npx"\nargs = ["-y", "@lorex/cli", "start"]\n`;
-      writeFileSync(codexPath, current + (current.endsWith("\n") || !current ? "" : "\n") + block);
-      done.push(`MCP: ${codexPath} (Codex)`);
-    } else {
-      done.push(`MCP: ${codexPath} already wired`);
-    }
+    const entry = lorexMcpCommand("codex");
+    const block = `[mcp_servers.lorex]\ncommand = ${JSON.stringify(entry.command)}\nargs = ${JSON.stringify(entry.args)}\n`;
+    const updated = upsertTomlSection(current, "mcp_servers.lorex", block);
+    if (updated !== current) writeFileSync(codexPath, updated);
+    done.push(`MCP: ${codexPath} (Codex${updated === current ? ", already current" : ""})`);
   }
 
   println(`Lorex wired for workspace "${workspace}".`);
@@ -354,6 +396,7 @@ async function cmdHooks(args: string[]): Promise<void> {
     return;
   }
 
+  ensureDurableLorexCommand();
   const { path, description } = installHooks(agent, projectRoot());
   println(`Hooks installed: ${path}`);
   for (const line of description.split("\n")) println(`  ${line}`);
@@ -470,11 +513,12 @@ async function cmdHarness(args: string[]): Promise<void> {
   const agent = agentIndex >= 0 ? args[agentIndex + 1] ?? "unknown" : "unknown";
   if (!input || typeof input !== "object") return;
   if (agent === "grok") {
-    const grok = input as HookInput & { hookEventName?: string; sessionId?: string; workspaceRoot?: string; lastAssistantMessage?: string };
+    const grok = input as HookInput & { hookEventName?: string; sessionId?: string; workspaceRoot?: string; lastAssistantMessage?: string; assistantMessage?: string };
     input.hook_event_name ??= grok.hookEventName;
     input.session_id ??= grok.sessionId;
     input.cwd ??= grok.workspaceRoot;
     input.last_assistant_message ??= grok.lastAssistantMessage;
+    input.assistant_message ??= grok.assistantMessage;
   }
   if (!input.hook_event_name) return;
   if (agent === "cursor") {
@@ -490,7 +534,7 @@ async function cmdHarness(args: string[]): Promise<void> {
     const output = await runHarnessEvent(engine, input, agent);
     if (output) println(output);
   } catch (e) {
-    process.stderr.write(`lorex harness: ${(e as Error).message}\n`);
+    process.stderr.write(`lorex harness (${agent} ${input.hook_event_name}): ${(e as Error).message}. The event was not committed; retry the hook or run lorex doctor.\n`);
     if (agent === "cursor" || input.hook_event_name === "Stop" || input.hook_event_name === "PreCompact") println("{}");
   }
 }
@@ -1229,6 +1273,7 @@ async function cmdConsole(): Promise<void> {
   const url = `http://127.0.0.1:${port}/`;
   println(`Lorex console: ${url}`);
   println("The daemon keeps running in the background; `lorex daemon stop` stops it.");
+  if (process.env.LOREX_NO_BROWSER === "1") return;
   try {
     const [opener, openerArgs] = process.platform === "win32"
       ? ["cmd", ["/c", "start", "", url]]
@@ -1265,7 +1310,7 @@ export interface CliCommandInfo {
  * drift apart.
  */
 export const CLI_COMMANDS: CliCommandInfo[] = [
-  { name: "console", summary: "Open the console — the single point of working (starts the daemon)", usage: "lorex (no arguments) or lorex console" },
+  { name: "console", summary: "Open the optional local browser interface", usage: "lorex console" },
   { name: "daemon", summary: "Run, stop, or inspect the resident Lorex service", usage: "lorex daemon [start|stop|status|run]" },
   { name: "admin", summary: "Run any command from the full surface", usage: "lorex admin <command> [args…]" },
   { name: "setup", summary: "Wire agents, install hooks, and smoke-test in one command", usage: "lorex setup [--workspace name] [--data-dir dir] [--yes]" },
@@ -1302,10 +1347,21 @@ export const CLI_COMMANDS: CliCommandInfo[] = [
 ];
 
 export async function runCli(argv: string[]): Promise<void> {
-  // Bare `lorex` is the product: it makes sure the daemon is up and hands you
-  // the console — the single point of working. Everything else still works.
-  const cmd = argv[0] ?? "console";
+  // A bare first run provisions the project and agent bridges. Subsequent
+  // invocations show the local memory status directly in the terminal.
+  const cmd = argv[0] ?? "status";
   const rest = argv.slice(1);
+
+  if (argv.length === 0) {
+    const root = projectRoot();
+    const configured = existsSync(projectConfigFile(root));
+    const wired = coreAgentConnections(root).every((entry) => entry.configured);
+    if (!configured || !wired) {
+      await cmdSetup(["--yes"]);
+      if (process.exitCode) return;
+      println();
+    }
+  }
 
   switch (cmd) {
     case "console": return cmdConsole();
@@ -1371,12 +1427,13 @@ const USAGE = `Lorex — local-first memory for coding agents.
     npx @lorex/cli setup
 
 Public commands:
-  lorex                      Open the console (starts the resident daemon)
+  lorex                      Set up this project on first run, then show terminal status
   lorex remember "fact"      Store a fact, with an optional reason (alias: add)
   lorex ask "question?"      Retrieve context and answer from it, or abstain
   lorex context [--plain]    Typed, budgeted context pack for injection
   lorex doctor               Verify setup, memory health, and model status
   lorex daemon [start|stop|status|run]
+  lorex console              Open the optional local browser interface
 
 Agent wiring:
   lorex wire                 Connect this project to your agents (.mcp.json)
