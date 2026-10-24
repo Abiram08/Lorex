@@ -17,32 +17,17 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { lorexCommand, lorexMcpCommand, renderLorexCommand } from "../infrastructure/runtime-command.js";
 
 /** Also lets isolated installers/tests target a portable agent configuration home. */
 export function agentHome(): string {
   return process.env.LOREX_AGENT_HOME?.trim() || homedir();
 }
 
-/**
- * Command prefix for hooks/skills/rules. Global installs use `lorex`;
- * npx/one-shot runs fall back to `npx -y @lorex/cli` so hooks work
- * even when the binary was never installed.
- */
+/** Shell command prefix used by lifecycle hooks and project guidance. */
 export function lorexBin(): string {
-  const entry = process.argv[1] ?? "";
-  // `npx` temporarily places a `lorex` shim on PATH. Treating that shim as a
-  // durable global install leaves broken hooks as soon as the npx process ends.
-  if (process.env.npm_command === "exec" || process.env.npm_lifecycle_event === "npx" || /[\\/]_npx[\\/]/i.test(entry)) {
-    return "npx -y @lorex/cli";
-  }
-  try {
-    execSync(process.platform === "win32" ? "where lorex" : "which lorex", { stdio: "ignore" });
-    return "lorex";
-  } catch {
-    return "npx -y @lorex/cli";
-  }
+  return renderLorexCommand(lorexCommand());
 }
 
 function readJson(path: string): Record<string, unknown> {
@@ -80,7 +65,15 @@ const LOREX_COMMAND =
 function isLorexHook(hook: Record<string, unknown>): boolean {
   const inner = (hook as { hooks?: Array<{ command?: unknown }> }).hooks;
   if (!Array.isArray(inner)) return false;
-  return inner.some((h) => typeof h?.command === "string" && LOREX_COMMAND.test(h.command));
+  return inner.some((h) => {
+    if (typeof h?.command !== "string") return false;
+    if (LOREX_COMMAND.test(h.command)) return true;
+    // Managed npx runtimes invoke `node <durable package>/dist/index.js`.
+    // Require both the package path and harness verb so unrelated Node hooks
+    // that merely live near a folder named Lorex are never removed.
+    return /(?:@lorex[\\/]cli|[\\/]\.lorex[\\/]runtime)[\\/].*dist[\\/]index\.js/i.test(h.command)
+      && /\sharness\s+--agent(?:\s|$)/.test(h.command);
+  });
 }
 
 function ensureHook(
@@ -147,15 +140,14 @@ function installClaudeCode(cwd: string): string {
   const bin = lorexBin();
   const { path, hooks, save } = loadHookSettings(cwd, ".claude", "settings.json");
   const command = `${bin} harness --agent claude-code`;
+  // Replace prior Lorex runtime commands without touching unrelated handlers.
+  for (const event of Object.keys(hooks)) {
+    hooks[event] = hooks[event]!.filter((hook) => !isLorexHook(hook) || hookExists([hook], command));
+  }
   ensureHook(hooks, "SessionStart", undefined, command);
   ensureHook(hooks, "UserPromptSubmit", undefined, command);
   ensureHook(hooks, "PreCompact", undefined, command);
   ensureHook(hooks, "Stop", undefined, command);
-  // Remove legacy Lorex handlers so a reinstall does not double-capture.
-  for (const event of Object.keys(hooks)) {
-    hooks[event] = hooks[event]!.filter((hook) => !isLorexHook(hook) || hookExists([hook], "harness --agent"));
-  }
-
   save();
   return path;
 }
@@ -169,7 +161,7 @@ function installCursor(cwd: string): string {
   const hooks = (config.hooks ?? {}) as Record<string, Array<{ command: string }>>;
   const command = `${bin} harness --agent cursor`;
   for (const event of ["sessionStart", "beforeSubmitPrompt", "afterAgentResponse", "preCompact", "stop"]) {
-    const list = hooks[event] ?? [];
+    const list = (hooks[event] ?? []).filter((hook) => !hook.command?.includes("harness --agent cursor") || hook.command === command);
     if (!list.some((hook) => hook.command === command)) list.push({ command });
     hooks[event] = list;
   }
@@ -220,6 +212,9 @@ function installCodex(cwd: string): string {
   appendGuidance(join(cwd, "AGENTS.md"), "## Lorex Memory", GUIDANCE_LINES(bin));
   const { path, hooks, save } = loadHookSettings(cwd, ".codex", "hooks.json");
   const command = `${bin} harness --agent codex`;
+  for (const event of Object.keys(hooks)) {
+    hooks[event] = hooks[event]!.filter((hook) => !isLorexHook(hook) || hookExists([hook], command));
+  }
   const contextOptions = { timeout: 30, additionalContextLimit: 1_200, statusMessage: "Loading Lorex memory" };
   const captureOptions = { timeout: 120, statusMessage: "Saving Lorex memory" };
   ensureHook(hooks, "SessionStart", undefined, command, contextOptions);
@@ -249,11 +244,8 @@ const INSTALLERS: Record<AgentKind, (cwd: string) => string> = {
   omp: installOmp,
 };
 
-function mcpServerEntry(): { command: string; args: string[] } {
-  const bin = lorexBin();
-  return bin === "lorex"
-    ? { command: "lorex", args: ["start"] }
-    : { command: "npx", args: ["-y", "@lorex/cli", "start"] };
+function mcpServerEntry(agent: string): { command: string; args: string[] } {
+  return lorexMcpCommand(agent);
 }
 
 const GUIDANCE_LINES = (bin: string): string[] => [
@@ -261,6 +253,17 @@ const GUIDANCE_LINES = (bin: string): string[] => [
   `Recall before answering about prior work; save decisions, preferences, and corrections.`,
   `Commands: \`${bin} resume --plain\` (load) · \`${bin} add "fact because reason"\` (remember)`,
 ];
+
+function upsertTomlSection(text: string, section: string, block: string): string {
+  const lines = text.split(/\r?\n/);
+  const header = `[${section}]`;
+  const start = lines.findIndex((line) => line.trim() === header);
+  if (start < 0) return text + (text && !text.endsWith("\n") ? "\n" : "") + block;
+  let end = start + 1;
+  while (end < lines.length && !/^\s*\[[^\]]+\]\s*$/.test(lines[end] ?? "")) end++;
+  const replacement = block.replace(/\n$/, "").split("\n");
+  return [...lines.slice(0, start), ...replacement, ...lines.slice(end)].join("\n").replace(/\n*$/, "\n");
+}
 
 function appendGuidance(path: string, header: string, lines: string[]): string {
   const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
@@ -274,7 +277,7 @@ function installOpenCode(cwd: string): string {
   const path = join(cwd, "opencode.json");
   const config = readJson(path);
   const mcp = (config.mcp ?? {}) as Record<string, unknown>;
-  const entry = mcpServerEntry();
+  const entry = mcpServerEntry("opencode");
   const command = [entry.command, ...entry.args];
   // New projects use v2. Preserve a detected v1 layout rather than migrating
   // unrelated servers behind the user's back.
@@ -295,19 +298,23 @@ function installOpenCode(cwd: string): string {
 function installGrok(cwd: string): string {
   const path = join(cwd, ".grok", "config.toml");
   mkdirSync(join(cwd, ".grok", "hooks"), { recursive: true });
-  const entry = mcpServerEntry();
+  const entry = mcpServerEntry("grok");
   const block = `[mcp_servers.lorex]\ncommand = ${JSON.stringify(entry.command)}\nargs = ${JSON.stringify(entry.args)}\n`;
   const current = existsSync(path) ? readFileSync(path, "utf8") : "";
-  if (!/^\[mcp_servers\.lorex\]\s*$/m.test(current)) {
-    writeFileSync(path, current + (current && !current.endsWith("\n") ? "\n" : "") + block);
-  }
+  const updated = upsertTomlSection(current, "mcp_servers.lorex", block);
+  if (updated !== current) writeFileSync(path, updated);
   const hooksPath = join(cwd, ".grok", "hooks", "lorex.json");
   const command = `${lorexBin()} harness --agent grok`;
-  const hooks: Record<string, Array<Record<string, unknown>>> = {};
+  const hookConfig = readJson(hooksPath);
+  const hooks = (hookConfig.hooks ?? {}) as Record<string, Array<Record<string, unknown>>>;
+  for (const event of Object.keys(hooks)) {
+    hooks[event] = hooks[event]!.filter((hook) => !isLorexHook(hook) || hookExists([hook], command));
+  }
   for (const event of ["SessionStart", "UserPromptSubmit", "Stop", "PreCompact"]) {
     ensureHook(hooks, event, undefined, command, { timeout: event === "Stop" ? 120 : 30 });
   }
-  writeJson(hooksPath, { hooks });
+  hookConfig.hooks = hooks;
+  writeJson(hooksPath, hookConfig);
   appendGuidance(join(cwd, "AGENTS.md"), "## Lorex Memory", GUIDANCE_LINES(lorexBin()));
   return path;
 }
@@ -317,7 +324,7 @@ function installGemini(cwd: string): string {
   mkdirSync(join(agentHome(), ".gemini"), { recursive: true });
   const settings = readJson(settingsPath);
   const servers = (settings.mcpServers ?? {}) as Record<string, unknown>;
-  servers.lorex = mcpServerEntry();
+  servers.lorex = mcpServerEntry("gemini");
   settings.mcpServers = servers;
   writeJson(settingsPath, settings);
   appendGuidance(join(cwd, "GEMINI.md"), "## Lorex Memory", GUIDANCE_LINES(lorexBin()));
@@ -338,7 +345,7 @@ function installCline(cwd: string): string {
   mkdirSync(join(path, ".."), { recursive: true });
   const settings = readJson(path);
   const servers = (settings.mcpServers ?? {}) as Record<string, unknown>;
-  servers.lorex = { ...mcpServerEntry(), disabled: false };
+  servers.lorex = { ...mcpServerEntry("cline"), disabled: false };
   settings.mcpServers = servers;
   writeJson(path, settings);
   const rulesPath = join(cwd, ".clinerules");
@@ -362,7 +369,7 @@ function installPi(cwd: string): string {
   mkdirSync(join(agentHome(), ".pi", "agent"), { recursive: true });
   const config = readJson(path);
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
-  servers.lorex = { ...mcpServerEntry(), lifecycle: "lazy" };
+  servers.lorex = { ...mcpServerEntry("pi"), lifecycle: "lazy" };
   config.mcpServers = servers;
   writeJson(path, config);
   appendGuidance(join(cwd, "AGENTS.md"), "## Lorex Memory", GUIDANCE_LINES(lorexBin()));
@@ -374,7 +381,7 @@ function installOmp(cwd: string): string {
   mkdirSync(join(cwd, ".omp"), { recursive: true });
   const config = readJson(path);
   const servers = (config.mcpServers ?? {}) as Record<string, unknown>;
-  servers.lorex = { type: "stdio", ...mcpServerEntry() };
+  servers.lorex = { type: "stdio", ...mcpServerEntry("omp") };
   config.mcpServers = servers;
   writeJson(path, config);
   return path;
@@ -413,39 +420,158 @@ function hooksContaining(path: string): string[] {
   return found;
 }
 
+export interface AgentConnectionStatus {
+  agent: "claude-code" | "codex" | "cursor" | "opencode" | "grok";
+  label: string;
+  configured: boolean;
+  capabilities: string[];
+  detail: string;
+  action?: string;
+}
+
+function guidanceInstalled(cwd: string): boolean {
+  const path = join(cwd, "AGENTS.md");
+  return existsSync(path) && readFileSync(path, "utf8").includes(GUIDANCE_END);
+}
+
+function jsonMcp(path: string, root: "mcpServers" | "mcp"): boolean {
+  const config = readJson(path);
+  const value = config[root] as Record<string, unknown> | undefined;
+  if (root === "mcpServers") return value?.lorex !== undefined;
+  return value?.lorex !== undefined || (value?.servers as Record<string, unknown> | undefined)?.lorex !== undefined;
+}
+
+function transientConfig(paths: string[]): boolean {
+  return paths.some((path) => existsSync(path) && /npx(?:\.cmd)?[\s\S]{0,200}@lorex[\\/]cli/i.test(readFileSync(path, "utf8")));
+}
+
+function attributedConfig(path: string, agent: string): boolean {
+  if (!existsSync(path)) return false;
+  const text = readFileSync(path, "utf8");
+  return text.includes("--agent") && text.includes(agent);
+}
+
+/** Honest configuration capabilities for the five core supported agents. */
+export function coreAgentConnections(cwd: string): AgentConnectionStatus[] {
+  const inspect = (agent: AgentConnectionStatus["agent"], label: string, fn: () => Omit<AgentConnectionStatus, "agent" | "label">): AgentConnectionStatus => {
+    try { return { agent, label, ...fn() }; }
+    catch (error) {
+      return {
+        agent, label, configured: false, capabilities: [],
+        detail: (error as Error).message,
+        action: `Repair the reported config, then run lorex setup again for ${label}.`,
+      };
+    }
+  };
+  const agentsGuidance = guidanceInstalled(cwd);
+  return [
+    inspect("claude-code", "Claude Code", () => {
+      const hookPath = join(cwd, ".claude", "settings.json");
+      const mcpPath = join(cwd, ".mcp.json");
+      const hooks = hooksContaining(hookPath);
+      const required = ["SessionStart", "UserPromptSubmit", "PreCompact", "Stop"];
+      const mcp = jsonMcp(mcpPath, "mcpServers") && attributedConfig(mcpPath, "claude-code");
+      const lifecycle = required.every((event) => hooks.includes(event));
+      const guidance = existsSync(join(cwd, ".claude", "skills", "lorex", "SKILL.md"));
+      const durable = !transientConfig([hookPath, mcpPath]);
+      const configured = mcp && guidance && durable && lifecycle;
+      return {
+        configured,
+        capabilities: [mcp && "MCP recall/write", lifecycle && "automatic context", lifecycle && "automatic capture", guidance && "skill guidance"].filter(Boolean) as string[],
+        detail: `${mcpPath}; ${hookPath}`,
+        action: configured ? "Restart Claude Code; verify one real SessionStart and Stop event before relying on capture." : "Run lorex setup to repair Claude Code MCP, skill, or lifecycle hooks.",
+      };
+    }),
+    inspect("codex", "Codex", () => {
+      const hookPath = join(cwd, ".codex", "hooks.json");
+      const mcpPath = join(agentHome(), ".codex", "config.toml");
+      const hooks = hooksContaining(hookPath);
+      const required = ["SessionStart", "UserPromptSubmit", "PreCompact", "Stop"];
+      const mcp = existsSync(mcpPath) && /^\[mcp_servers\.lorex\]\s*$/m.test(readFileSync(mcpPath, "utf8")) && attributedConfig(mcpPath, "codex");
+      const lifecycle = required.every((event) => hooks.includes(event));
+      const durable = !transientConfig([hookPath, mcpPath]);
+      const configured = mcp && agentsGuidance && durable && lifecycle;
+      return {
+        configured,
+        capabilities: [mcp && "MCP recall/write", lifecycle && "automatic context", lifecycle && "automatic capture", agentsGuidance && "AGENTS.md guidance"].filter(Boolean) as string[],
+        detail: `${mcpPath}; ${hookPath}`,
+        action: configured ? "Restart Codex and trust the project hooks in /hooks; real hook execution is not inferred from these files." : "Run lorex setup to repair Codex MCP, guidance, or lifecycle hooks.",
+      };
+    }),
+    inspect("cursor", "Cursor", () => {
+      const hookPath = join(cwd, ".cursor", "hooks.json");
+      const mcpPath = join(cwd, ".cursor", "mcp.json");
+      const config = readJson(hookPath);
+      const hooks = (config.hooks ?? {}) as Record<string, Array<{ command?: string }>>;
+      const required = ["sessionStart", "beforeSubmitPrompt", "afterAgentResponse", "preCompact", "stop"];
+      const lifecycle = required.every((event) => hooks[event]?.some((hook) => hook.command?.includes("harness --agent cursor")));
+      const mcp = jsonMcp(mcpPath, "mcpServers") && attributedConfig(mcpPath, "cursor");
+      const durable = !transientConfig([hookPath, mcpPath]);
+      const configured = mcp && lifecycle && durable;
+      return {
+        configured,
+        capabilities: [mcp && "MCP recall/write", lifecycle && "automatic context", lifecycle && "automatic capture"].filter(Boolean) as string[],
+        detail: `${mcpPath}; ${hookPath}`,
+        action: configured ? "Restart Cursor; verify one real sessionStart and afterAgentResponse event before relying on capture." : "Run lorex setup to repair Cursor MCP or native lifecycle hooks.",
+      };
+    }),
+    inspect("opencode", "OpenCode", () => {
+      const path = join(cwd, "opencode.json");
+      const mcp = jsonMcp(path, "mcp") && attributedConfig(path, "opencode");
+      const durable = !transientConfig([path]);
+      const configured = mcp && agentsGuidance && durable;
+      return {
+        configured,
+        capabilities: [mcp && "MCP recall/write", agentsGuidance && "AGENTS.md guidance", "no automatic capture"].filter(Boolean) as string[],
+        detail: `${path}; ${join(cwd, "AGENTS.md")}`,
+        action: configured ? "Restart OpenCode. Use Lorex MCP tools as guided; no lifecycle capture is claimed." : "Run lorex setup to repair OpenCode MCP or guidance.",
+      };
+    }),
+    inspect("grok", "Grok Build", () => {
+      const mcpPath = join(cwd, ".grok", "config.toml");
+      const hookPath = join(cwd, ".grok", "hooks", "lorex.json");
+      const hooks = hooksContaining(hookPath);
+      const required = ["SessionStart", "UserPromptSubmit", "PreCompact", "Stop"];
+      const mcp = existsSync(mcpPath) && /^\[mcp_servers\.lorex\]\s*$/m.test(readFileSync(mcpPath, "utf8")) && attributedConfig(mcpPath, "grok");
+      const capture = required.every((event) => hooks.includes(event));
+      const durable = !transientConfig([mcpPath, hookPath]);
+      const configured = mcp && capture && agentsGuidance && durable;
+      return {
+        configured,
+        capabilities: [mcp && "MCP recall/write", capture && "automatic capture hooks", agentsGuidance && "AGENTS.md guidance", "context via MCP guidance"].filter(Boolean) as string[],
+        detail: `${mcpPath}; ${hookPath}`,
+        action: configured ? "Restart Grok Build and approve /hooks-trust. Passive hook stdout is not claimed as automatic context injection." : "Run lorex setup to repair Grok Build MCP, guidance, or hooks.",
+      };
+    }),
+  ];
+}
+
 /** Which agents have Lorex wired in this project. */
 export function hooksStatus(cwd: string): Array<{ agent: AgentKind; configured: boolean; detail: string }> {
-  const claude = hooksContaining(join(cwd, ".claude", "settings.json"));
-  const cursorConfig = readJson(join(cwd, ".cursor", "hooks.json"));
-  const cursorHooks = (cursorConfig.hooks ?? {}) as Record<string, Array<{ command?: string }>>;
-  const cursor = ["sessionStart", "beforeSubmitPrompt", "afterAgentResponse"].every((event) =>
-    cursorHooks[event]?.some((hook) => hook.command?.includes("harness --agent cursor")));
+  const safe = (fn: () => boolean): boolean => { try { return fn(); } catch { return false; } };
   const windsurfPath = join(cwd, ".windsurfrules");
-  const codexPath = join(cwd, ".codex", "hooks.json");
-  const windsurf = existsSync(windsurfPath) && readFileSync(windsurfPath, "utf8").includes(GUIDANCE_END);
-  const codex = hooksContaining(codexPath);
-  const openCodeMcp = (readJson(join(cwd, "opencode.json")).mcp ?? {}) as Record<string, unknown>;
-  const openCode = openCodeMcp.lorex !== undefined || (openCodeMcp.servers as Record<string, unknown> | undefined)?.lorex !== undefined;
-  const grok = /^\[mcp_servers\.lorex\]\s*$/m.test(existsSync(join(cwd, ".grok", "config.toml")) ? readFileSync(join(cwd, ".grok", "config.toml"), "utf8") : "")
-    && hooksContaining(join(cwd, ".grok", "hooks", "lorex.json")).includes("SessionStart");
-  const gemini = (readJson(join(agentHome(), ".gemini", "settings.json")).mcpServers as Record<string, unknown> | undefined)?.lorex !== undefined;
-  const cline = (readJson(clineSettingsPath()).mcpServers as Record<string, unknown> | undefined)?.lorex !== undefined;
   const agentsPath = join(cwd, "AGENTS.md");
-  const aider = existsSync(agentsPath) && readFileSync(agentsPath, "utf8").includes(GUIDANCE_END);
-  const pi = (readJson(join(agentHome(), ".pi", "agent", "mcp.json")).mcpServers as Record<string, unknown> | undefined)?.lorex !== undefined;
-  const omp = (readJson(join(cwd, ".omp", "mcp.json")).mcpServers as Record<string, unknown> | undefined)?.lorex !== undefined;
+  const claude = safe(() => ["SessionStart", "UserPromptSubmit", "PreCompact", "Stop"].every((event) => hooksContaining(join(cwd, ".claude", "settings.json")).includes(event)));
+  const codex = safe(() => ["SessionStart", "UserPromptSubmit", "PreCompact", "Stop"].every((event) => hooksContaining(join(cwd, ".codex", "hooks.json")).includes(event)));
+  const cursor = safe(() => {
+    const config = readJson(join(cwd, ".cursor", "hooks.json"));
+    const hooks = (config.hooks ?? {}) as Record<string, Array<{ command?: string }>>;
+    return ["sessionStart", "beforeSubmitPrompt", "afterAgentResponse", "preCompact", "stop"].every((event) => hooks[event]?.some((hook) => hook.command?.includes("harness --agent cursor")));
+  });
+  const openCode = safe(() => jsonMcp(join(cwd, "opencode.json"), "mcp"));
+  const grok = safe(() => ["SessionStart", "UserPromptSubmit", "PreCompact", "Stop"].every((event) => hooksContaining(join(cwd, ".grok", "hooks", "lorex.json")).includes(event)));
   return [
-    { agent: "claude-code", configured: claude.length > 0, detail: claude.length ? `hooks: ${claude.join(", ")}` : "no hooks" },
-    { agent: "cursor", configured: cursor, detail: cursor ? ".cursor/hooks.json" : "no hooks" },
-    { agent: "windsurf", configured: windsurf, detail: windsurf ? ".windsurfrules" : "no rules" },
-    { agent: "codex", configured: codex.includes("SessionStart") && codex.includes("UserPromptSubmit") && codex.includes("Stop"), detail: codex.length ? `hooks: ${codex.join(", ")}` : "no hooks" },
-    { agent: "opencode", configured: openCode, detail: openCode ? "opencode.json" : "no config" },
-    { agent: "grok", configured: grok, detail: grok ? ".grok/config.toml + hooks" : "no config" },
-    { agent: "gemini", configured: gemini, detail: gemini ? "~/.gemini/settings.json" : "no config" },
-    { agent: "cline", configured: cline, detail: cline ? "cline_mcp_settings.json" : "no config" },
-    { agent: "aider", configured: aider, detail: aider ? "AGENTS.md" : "no conventions" },
-    { agent: "pi", configured: pi, detail: pi ? "~/.pi/agent/mcp.json" : "no config" },
-    { agent: "omp", configured: omp, detail: omp ? ".omp/mcp.json" : "no config" },
+    { agent: "claude-code", configured: claude, detail: claude ? ".claude/settings.json" : "no complete hook set" },
+    { agent: "codex", configured: codex, detail: codex ? ".codex/hooks.json" : "no complete hook set" },
+    { agent: "cursor", configured: cursor, detail: cursor ? ".cursor/hooks.json" : "no complete hook set" },
+    { agent: "opencode", configured: openCode, detail: openCode ? "MCP only; no lifecycle hooks" : "no config" },
+    { agent: "grok", configured: grok, detail: grok ? ".grok/hooks/lorex.json" : "no complete hook set" },
+    { agent: "windsurf", configured: safe(() => existsSync(windsurfPath) && readFileSync(windsurfPath, "utf8").includes(GUIDANCE_END)), detail: ".windsurfrules" },
+    { agent: "gemini", configured: safe(() => (readJson(join(agentHome(), ".gemini", "settings.json")).mcpServers as Record<string, unknown> | undefined)?.lorex !== undefined), detail: "~/.gemini/settings.json" },
+    { agent: "cline", configured: safe(() => (readJson(clineSettingsPath()).mcpServers as Record<string, unknown> | undefined)?.lorex !== undefined), detail: "cline_mcp_settings.json" },
+    { agent: "aider", configured: safe(() => existsSync(agentsPath) && readFileSync(agentsPath, "utf8").includes(GUIDANCE_END)), detail: "AGENTS.md" },
+    { agent: "pi", configured: safe(() => (readJson(join(agentHome(), ".pi", "agent", "mcp.json")).mcpServers as Record<string, unknown> | undefined)?.lorex !== undefined), detail: "~/.pi/agent/mcp.json" },
+    { agent: "omp", configured: safe(() => (readJson(join(cwd, ".omp", "mcp.json")).mcpServers as Record<string, unknown> | undefined)?.lorex !== undefined), detail: ".omp/mcp.json" },
   ];
 }
 
