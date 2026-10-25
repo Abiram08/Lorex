@@ -35,7 +35,7 @@ interface Turn {
   timestamp?: string;
 }
 
-interface Cursor { offset: number; firstLineHash: string }
+interface Cursor { offset: number; firstLineHash: string; boundaryHash?: string }
 const MAX_LINE_BYTES = 16 * 1024 * 1024;
 const BATCH_TURNS = 100;
 const BATCH_CHARS = 400_000;
@@ -55,7 +55,8 @@ function readCursor(file: string): Cursor | null {
   if (!existsSync(file)) return null;
   try {
     const parsed = JSON.parse(readFileSync(file, "utf8")) as Partial<Cursor>;
-    if (Number.isSafeInteger(parsed.offset) && parsed.offset! >= 0 && typeof parsed.firstLineHash === "string") {
+    if (Number.isSafeInteger(parsed.offset) && parsed.offset! >= 0 && typeof parsed.firstLineHash === "string" &&
+        (parsed.boundaryHash === undefined || typeof parsed.boundaryHash === "string")) {
       return parsed as Cursor;
     }
   } catch { /* A broken cursor replays with deterministic IDs rather than skipping data. */ }
@@ -96,12 +97,27 @@ function firstLineHash(path: string): string {
   } finally { closeSync(fd); }
 }
 
+/** Hash bytes immediately before a cursor. This distinguishes a true append
+ * from a transcript rewritten in place while keeping the same first line. */
+function boundaryHash(path: string, offset: number): string {
+  if (offset <= 0) return hash("");
+  const fd = openSync(path, "r");
+  try {
+    const start = Math.max(0, offset - 4096);
+    const bytes = Buffer.alloc(offset - start);
+    const count = readSync(fd, bytes, 0, bytes.length, start);
+    return hash(bytes.subarray(0, count));
+  } finally { closeSync(fd); }
+}
+
 function textBlocks(value: unknown): string {
   if (typeof value === "string") return value;
   if (Array.isArray(value)) {
     return value.filter((part): part is { type?: string; text: string } =>
       !!part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string" &&
-      (!(part as { type?: unknown }).type || (part as { type?: unknown }).type === "text"),
+      // Claude uses `text`; Responses/Codex transcripts use input_text and
+      // output_text. Keeping all three retains the exact conversational source.
+      !((part as { type?: unknown }).type) || ["text", "input_text", "output_text"].includes(String((part as { type?: unknown }).type)),
     ).map((part) => part.text).join("\n");
   }
   return "";
@@ -151,7 +167,9 @@ export async function captureTranscript(engine: LorexEngine, opts: CaptureOpts):
     const size = statSync(path).size;
     const signature = firstLineHash(path);
     const previous = opts.incremental ? readCursor(file) : null;
-    let committed = previous && previous.offset <= size && previous.firstLineHash === signature ? previous.offset : 0;
+    const validPrevious = previous && previous.offset <= size && previous.firstLineHash === signature &&
+      !!previous.boundaryHash && previous.boundaryHash === boundaryHash(path, previous.offset);
+    let committed = validPrevious ? previous.offset : 0;
     const result: CaptureResult = { sessionId, chunkCount: 0, factCount: 0, tokenCount: 0, duplicateCount: 0, errors: [], partial: false };
     if (committed === size) return result;
 
@@ -165,7 +183,10 @@ export async function captureTranscript(engine: LorexEngine, opts: CaptureOpts):
 
     const flush = async (): Promise<boolean> => {
       if (!batch.length) {
-        if (opts.incremental && batchEnd > committed) { writeCursor(file, { offset: batchEnd, firstLineHash: signature }); committed = batchEnd; }
+        if (opts.incremental && batchEnd > committed) {
+          writeCursor(file, { offset: batchEnd, firstLineHash: signature, boundaryHash: boundaryHash(path, batchEnd) });
+          committed = batchEnd;
+        }
         batchStart = batchEnd;
         return true;
       }
@@ -189,7 +210,9 @@ export async function captureTranscript(engine: LorexEngine, opts: CaptureOpts):
         result.partial = result.chunkCount > 0 || result.factCount > 0;
         return false;
       }
-      if (opts.incremental) writeCursor(file, { offset: batchEnd, firstLineHash: signature });
+      if (opts.incremental) {
+        writeCursor(file, { offset: batchEnd, firstLineHash: signature, boundaryHash: boundaryHash(path, batchEnd) });
+      }
       committed = batchEnd;
       batch = [];
       batchChars = 0;
