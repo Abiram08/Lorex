@@ -466,19 +466,31 @@ export async function startDaemonService(opts: DaemonOptions = {}): Promise<Daem
     }
 
     if (method === "POST" && (path === "/v1/hooks/stop" || path === "/v1/hooks/pre-compact")) {
-      const body = (await readJson<{ cwd?: string; agent?: string; sessionId?: string; prompt?: string; response?: string }>(req)) ?? {};
-      if (!body.sessionId || !body.prompt?.trim() || !body.response?.trim() ||
-          body.prompt.length > 40_000 || body.response.length > 40_000) {
-        return json(res, 400, { error: "sessionId, prompt and response (each <= 40000 chars) are required; lifecycle hooks use `lorex harness`" });
+      const body = (await readJson<{
+        cwd?: string; agent?: string; sessionId?: string; prompt?: string; response?: string;
+        last_assistant_message?: string; assistant_message?: string; text?: string; timestamp?: string;
+      }>(req)) ?? {};
+      const response = [body.response, body.last_assistant_message, body.assistant_message, body.text]
+        .find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
+      const occurredAt = typeof body.timestamp === "string" && !Number.isNaN(Date.parse(body.timestamp))
+        ? body.timestamp
+        : undefined;
+      if (typeof body.sessionId !== "string" || !body.sessionId.trim() || typeof body.prompt !== "string" || !body.prompt.trim() || !response ||
+          body.prompt.length > 40_000 || response.length > 40_000) {
+        return json(res, 400, { error: "sessionId, prompt and a completed response (each <= 40000 chars) are required; response, last_assistant_message, assistant_message, and text are accepted" });
       }
+      // Keep narrowed request values outside the asynchronous queue closure.
+      const sessionId = body.sessionId;
+      const prompt = body.prompt;
+      const completedResponse = response;
       const hookCwd = body.cwd ?? bootCwd;
       const withDream = path.endsWith("/stop");
       enqueue(path.slice("/v1/hooks/".length), async () => {
         const engine = await engineFor(hookCwd, body.agent);
         const identity = engine.getIdentity();
-        const captureId = `hook_${createHash("sha256").update(`${body.agent ?? "unknown"}|${body.sessionId}|${body.prompt}|${body.response}`).digest("hex").slice(0, 24)}`;
+        const captureId = `hook_${createHash("sha256").update(`${body.agent ?? "unknown"}|${sessionId}|${prompt}|${completedResponse}`).digest("hex").slice(0, 24)}`;
         const session = normalizeSession(captureId, identity.database, identity.collection,
-          [{ role: "user", content: body.prompt! }, { role: "assistant", content: body.response! }],
+          [{ role: "user", content: prompt }, { role: "assistant", content: completedResponse, occurredAt }],
           { agent: body.agent ?? "unknown", source: "daemon-hook" });
         const captured = await engine.ingestSession(session);
         if (captured.partial || captured.errors.length) throw new Error(captured.errors.join("; ") || "partial hook capture");

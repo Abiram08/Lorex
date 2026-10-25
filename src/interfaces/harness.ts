@@ -19,10 +19,14 @@ export interface HookInput {
   cwd?: string;
   prompt?: string;
   last_assistant_message?: string | null;
+  /** Common completion-field aliases used by agent hook protocols. */
+  response?: string | null;
+  assistant_message?: string | null;
   conversation_id?: string;
   generation_id?: string;
   workspace_roots?: string[];
   text?: string;
+  timestamp?: string;
 }
 
 interface PendingTurn { prompt: string; turnId?: string; createdAt?: string }
@@ -54,9 +58,27 @@ function stagePrompt(engine: LorexEngine, input: HookInput): void {
   writeFileSync(temp, JSON.stringify({
     prompt: redactSecrets(input.prompt).text,
     turnId: input.turn_id,
-    createdAt: new Date().toISOString(),
+    // Keep the time the user supplied when the hook protocol has one. It makes
+    // temporal recall reflect the conversation rather than a later Stop event.
+    createdAt: validTimestamp(input.timestamp) ?? new Date().toISOString(),
   } satisfies PendingTurn), { mode: 0o600 });
   renameSync(temp, file);
+}
+
+function validTimestamp(value: string | undefined): string | undefined {
+  return value && !Number.isNaN(Date.parse(value)) ? value : undefined;
+}
+
+/** Agents disagree on the completion field name. Treat the explicit response
+ * aliases as equivalent and keep Cursor's native `text` as its final fallback. */
+function assistantResponse(input: HookInput): string | undefined {
+  const candidates = [
+    input.last_assistant_message,
+    input.assistant_message,
+    input.response,
+    input.text,
+  ];
+  return candidates.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
 }
 
 function discardPending(engine: LorexEngine, input: HookInput): void {
@@ -74,13 +96,13 @@ function readPending(engine: LorexEngine, input: HookInput): PendingTurn | null 
 
 async function captureHookTurn(engine: LorexEngine, input: HookInput, agent: string): Promise<boolean> {
   const pending = readPending(engine, input);
-  const answer = input.last_assistant_message?.trim();
+  const answer = assistantResponse(input);
   if (!pending?.prompt.trim() || !answer) return false;
   const identity = engine.getIdentity();
   const sessionId = `hook_${hash(`${agent}|${input.session_id}|${pending.turnId ?? pending.prompt}`)}`;
   const turns = [
-    ...splitText(pending.prompt, "user"),
-    ...splitText(answer, "assistant"),
+    ...splitText(pending.prompt, "user", pending.createdAt),
+    ...splitText(redactSecrets(answer).text, "assistant", validTimestamp(input.timestamp)),
   ];
   const session = normalizeSession(sessionId, identity.database, identity.collection, turns, { agent, source: "hook" });
   const result = await engine.ingestSession(session);
@@ -89,9 +111,13 @@ async function captureHookTurn(engine: LorexEngine, input: HookInput, agent: str
   return result.chunkCount > 0 || result.factCount > 0;
 }
 
-function splitText(content: string, role: "user" | "assistant"): Array<{ role: "user" | "assistant"; content: string }> {
-  const out: Array<{ role: "user" | "assistant"; content: string }> = [];
-  for (let i = 0; i < content.length; i += 40_000) out.push({ role, content: content.slice(i, i + 40_000) });
+function splitText(
+  content: string,
+  role: "user" | "assistant",
+  occurredAt?: string,
+): Array<{ role: "user" | "assistant"; content: string; occurredAt?: string }> {
+  const out: Array<{ role: "user" | "assistant"; content: string; occurredAt?: string }> = [];
+  for (let i = 0; i < content.length; i += 40_000) out.push({ role, content: content.slice(i, i + 40_000), occurredAt });
   return out;
 }
 
@@ -166,7 +192,10 @@ export async function runHarnessEvent(engine: LorexEngine, input: HookInput, age
         saved = result.chunkCount > 0 || result.factCount > 0;
         discardPending(engine, input);
       }
-    } else if (event === "Stop") {
+    // A compaction hook can include the completed response. Capture it now:
+    // a later Stop hook may not have that response after compaction. If there
+    // is no response, leave the staged prompt intact for Stop to finish.
+    } else if (event === "Stop" || assistantResponse(input)) {
       saved = await captureHookTurn(engine, input, agent);
     }
     if (saved && event === "Stop") await engine.dreamAuto();
