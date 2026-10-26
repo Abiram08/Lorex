@@ -133,7 +133,7 @@ try {
   const queuedCapture = await postJson("/v1/hooks/stop", {
     cwd: project, agent: "codex", sessionId: "daemon-test-session",
     prompt: "We decided to use append-only task events for concurrent agents.",
-    response: "Recorded the task event design.",
+    assistant_message: "Recorded the task event design.",
   });
   assert.equal(queuedCapture.queued, true);
   let captured = false;

@@ -174,7 +174,7 @@ function freshDir(): string {
   assert.ok(oc.path.endsWith("opencode.json"));
   const oconf = JSON.parse(readFileSync(oc.path, "utf8")) as { mcp?: Record<string, unknown> };
   assert.ok((oconf.mcp?.servers as Record<string, unknown>)?.lorex, "OpenCode v2 MCP entry written by default");
-  assert.deepEqual(((oconf.mcp?.servers as Record<string, { command: string[] }>).lorex).command.slice(-1), ["start"], "OpenCode command is an argv array");
+  assert.deepEqual(((oconf.mcp?.servers as Record<string, { command: string[] }>).lorex).command.slice(-3), ["start", "--agent", "opencode"], "OpenCode command is an attributed argv array");
   assert.ok(readFileSync(join(dir, "AGENTS.md"), "utf8").includes("lorex"), "opencode guidance written");
 
   const aider = installHooks("aider", dir);
@@ -202,7 +202,7 @@ function freshDir(): string {
   installHooks("opencode", dir);
   const config = JSON.parse(readFileSync(path, "utf8")) as { mcp: Record<string, { command: string[] }> };
   assert.ok(config.mcp.existing, "OpenCode v1 preserves other servers");
-  assert.deepEqual(config.mcp.lorex?.command.slice(-1), ["start"]);
+  assert.deepEqual(config.mcp.lorex?.command.slice(-3), ["start", "--agent", "opencode"]);
 }
 
 {
@@ -212,15 +212,21 @@ function freshDir(): string {
   installHooks("opencode", dir);
   const config = JSON.parse(readFileSync(path, "utf8")) as { mcp: { servers: Record<string, { command: string[] }> } };
   assert.ok(config.mcp.servers.existing, "OpenCode v2 preserves other servers");
-  assert.deepEqual(config.mcp.servers.lorex?.command.slice(-1), ["start"]);
+  assert.deepEqual(config.mcp.servers.lorex?.command.slice(-3), ["start", "--agent", "opencode"]);
   assert.ok(uninstallHooks("opencode", dir).removed);
 }
 
 {
   const dir = freshDir();
+  mkdirSync(join(dir, ".grok", "hooks"), { recursive: true });
+  writeFileSync(join(dir, ".grok", "config.toml"), "[telemetry]\nenabled = false\n");
+  writeFileSync(join(dir, ".grok", "hooks", "lorex.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "echo keep-me" }] }] }, custom: true }));
   const grok = installHooks("grok", dir);
   assert.ok(readFileSync(grok.path, "utf8").includes("[mcp_servers.lorex]"));
-  assert.ok(readFileSync(join(dir, ".grok", "hooks", "lorex.json"), "utf8").includes("harness --agent grok"));
+  assert.ok(readFileSync(grok.path, "utf8").includes("[telemetry]"), "Grok TOML keeps unrelated settings");
+  const grokHooks = readFileSync(join(dir, ".grok", "hooks", "lorex.json"), "utf8");
+  assert.ok(grokHooks.includes("harness --agent grok"));
+  assert.ok(grokHooks.includes("keep-me") && grokHooks.includes('"custom": true'), "Grok hook install preserves unrelated config");
   assert.ok(hooksStatus(dir).find((s) => s.agent === "grok")?.configured);
   assert.ok(uninstallHooks("grok", dir).removed);
   assert.ok(!hooksStatus(dir).find((s) => s.agent === "grok")?.configured);
@@ -312,12 +318,16 @@ import { detectLocalModels, resetLocalModelsCache } from "../infrastructure/loca
   try {
     // --yes keeps the suite non-interactive: without it, a terminal run (TTY)
     // would stop at setup's "Where should memory live?" prompt.
-    await runCli(["setup", "--workspace", "cli-test", "--yes"]);
+    const setupOutput = await captureOutput(() => runCli(["setup", "--workspace", "cli-test", "--yes"]));
+    assert.ok(setupOutput.includes("shared store works: OpenCode identity recalled a Claude Code source"), "setup verifies cross-agent memory and source attribution with independent store clients");
     assert.ok(existsSync(join(dir, ".mcp.json")), ".mcp.json written");
     assert.ok(existsSync(join(dir, ".claude", "settings.json")), "claude hooks written");
     assert.ok(existsSync(join(dir, ".codex", "hooks.json")), "codex hooks written");
     assert.ok(existsSync(join(dir, ".cursor", "mcp.json")), "cursor MCP written");
-    assert.ok(readFileSync(join(fakeUser, ".codex", "config.toml"), "utf8").includes("mcp_servers.lorex"), "codex MCP wired");
+    assert.ok(readFileSync(join(dir, ".mcp.json"), "utf8").includes("claude-code"), "generic project MCP preserves Claude Code attribution");
+    assert.ok(readFileSync(join(dir, ".cursor", "mcp.json"), "utf8").includes("cursor"), "Cursor MCP preserves agent attribution");
+    const codexMcp = readFileSync(join(fakeUser, ".codex", "config.toml"), "utf8");
+    assert.ok(codexMcp.includes("mcp_servers.lorex") && codexMcp.includes('"codex"'), "Codex MCP wired with agent attribution");
     assert.equal(JSON.parse(readFileSync(join(dir, ".lorex.json"), "utf8")).workspace, "cli-test");
 
     await runCli(["status"]);
@@ -363,7 +373,10 @@ import { detectLocalModels, resetLocalModelsCache } from "../infrastructure/loca
   writeFileSync(
     settingsPath,
     JSON.stringify(
-      { hooks: { Stop: [{ hooks: [{ type: "command", command: "echo 'lorex is my favourite tool'" }] }] } },
+      { hooks: { Stop: [
+        { hooks: [{ type: "command", command: "echo 'lorex is my favourite tool'" }] },
+        { hooks: [{ type: "command", command: "npx -y @lorex/cli harness --agent claude-code" }] },
+      ] } },
       null,
       2,
     ),
@@ -372,6 +385,8 @@ import { detectLocalModels, resetLocalModelsCache } from "../infrastructure/loca
   installHooks("claude-code", dir);
   const installed = readFileSync(settingsPath, "utf8");
   assert.ok(installed.includes("my favourite tool"), "install leaves the user's own hook alone");
+  assert.ok(!installed.includes("npx -y @lorex/cli"), "install replaces a stale transient Lorex hook");
+  assert.equal((installed.match(/harness --agent claude-code/g) ?? []).length, 4, "exactly one current hook is installed for each lifecycle event");
 
   uninstallHooks("claude-code", dir);
   const cleaned = readFileSync(settingsPath, "utf8");

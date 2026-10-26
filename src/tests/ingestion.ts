@@ -167,6 +167,11 @@ import { resolveIdentity } from "../infrastructure/identity.js";
 import { captureTranscript } from "../ingestion/session-capture.js";
 
 {
+  // Parser fixtures use MockHydraDB and must not touch a developer's shared
+  // usage lock when a local daemon is running at the same time.
+  const oldNoLimits = process.env.LOREX_NO_LIMITS;
+  process.env.LOREX_NO_LIMITS = "1";
+  try {
   const dir = mkdtempSync(join(tmpdir(), "lorex-parse-test-"));
   const engine = new LorexEngine(new MockHydraDB(), resolveIdentity(dir, { collection: "parse" }));
 
@@ -190,6 +195,10 @@ import { captureTranscript } from "../ingestion/session-capture.js";
 
   const r4 = await captureTranscript(engine, { transcriptPath: join(dir, "nope.jsonl") });
   assert.ok(r4.errors.length > 0, "missing file reports an error");
+  } finally {
+    if (oldNoLimits === undefined) delete process.env.LOREX_NO_LIMITS;
+    else process.env.LOREX_NO_LIMITS = oldNoLimits;
+  }
 }
 
 console.log("✓ transcript parser tests passed");
