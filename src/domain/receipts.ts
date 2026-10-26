@@ -40,6 +40,11 @@ export interface ReceiptSource {
   agent?: string;
   memory_type?: string;
   reason?: string;
+  trust?: string;
+  source_session_id?: string;
+  root_session_id?: string;
+  source_event_id?: string;
+  evidence_ids?: string[];
 }
 
 export interface Receipt<T = unknown> {

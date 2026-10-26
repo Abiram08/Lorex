@@ -17,6 +17,11 @@ export interface Evidence {
   memoryType?: string;
   reason?: string;
   status?: string;
+  trust?: string;
+  sourceSessionId?: string;
+  rootSessionId?: string;
+  sourceEventId?: string;
+  evidenceIds?: string[];
   excerpt: string;
 }
 

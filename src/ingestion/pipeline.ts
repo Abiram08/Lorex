@@ -74,7 +74,7 @@ export async function ingestSession(
   let memoryIds: string[] = [];
 
   try {
-    knowledgeIds = await storeChunks(client, chunks, options, session.rootSessionId);
+    knowledgeIds = await storeChunks(client, chunks, options, session.rootSessionId, session.agent, session.source);
   } catch (e) {
     errors.push(`chunks: ${(e as Error).message}`);
   }
@@ -83,7 +83,7 @@ export async function ingestSession(
     errors.push("facts: skipped because source chunks were not stored completely");
   } else {
     try {
-      memoryIds = await storeFacts(client, facts.filter((fact) => fact.evidenceIds.length > 0), options, session.rootSessionId);
+      memoryIds = await storeFacts(client, facts.filter((fact) => fact.evidenceIds.length > 0), options, session.rootSessionId, session.agent, session.source);
     } catch (e) {
       errors.push(`facts: ${(e as Error).message}`);
     }
@@ -124,6 +124,8 @@ async function storeChunks(
   chunks: Chunk[],
   options: IngestionPipelineOptions,
   rootSessionId?: string,
+  agent?: string,
+  source?: string,
 ): Promise<string[]> {
   if (chunks.length === 0) return [];
   const ids: string[] = [];
@@ -136,6 +138,7 @@ async function storeChunks(
       additional_metadata: {
         schema_version: METADATA_SCHEMA_VERSION,
         session_id: chunk.sessionId,
+        source_session_id: chunk.sessionId,
         root_session_id: rootSessionId ?? chunk.sessionId,
         chunk_sequence: chunk.chunkSequence,
         total_chunks: chunk.totalChunks,
@@ -144,6 +147,8 @@ async function storeChunks(
         occurred_at: chunk.occurredAt,
         memory_type: "conversation_chunk",
         source_ref: chunk.sessionId,
+        source,
+        agent,
         trust: "verbatim_source",
       },
     }));
@@ -163,6 +168,8 @@ async function storeFacts(
   facts: ExtractedFact[],
   options: IngestionPipelineOptions,
   rootSessionId?: string,
+  agent?: string,
+  source?: string,
 ): Promise<string[]> {
   if (facts.length === 0) return [];
 
@@ -219,6 +226,8 @@ async function storeFacts(
       source_session_id: fact.sessionId,
       root_session_id: rootSessionId ?? fact.sessionId,
       source_event_id: fact.eventId,
+      source,
+      agent,
       status: "current",
       trust: "heuristic_extract",
     };

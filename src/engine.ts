@@ -1377,6 +1377,9 @@ export class LorexEngine {
           status: "current",
           agent: this.agent,
           confidence: d.confidence,
+          extraction_confidence: d.confidence,
+          evidence_ids: d.sourceIds,
+          trust: "inferred_pattern",
           source: `dream:${d.source}`,
         },
       })),
@@ -1807,6 +1810,11 @@ export class LorexEngine {
       agent: md.agent as string | undefined,
       memory_type: md.memory_type as string | undefined,
       reason: md.reason as string | undefined,
+      trust: md.trust as string | undefined,
+      source_session_id: md.source_session_id as string | undefined,
+      root_session_id: md.root_session_id as string | undefined,
+      source_event_id: md.source_event_id as string | undefined,
+      evidence_ids: md.evidence_ids as string[] | undefined,
     };
   }
 
@@ -1825,6 +1833,11 @@ export class LorexEngine {
       memory_type: e.memoryType,
       reason: e.reason,
       status: e.status,
+      trust: e.trust,
+      source_session_id: e.sourceSessionId,
+      root_session_id: e.rootSessionId,
+      source_event_id: e.sourceEventId,
+      evidence_ids: e.evidenceIds,
     };
   }
 }

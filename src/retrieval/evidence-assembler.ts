@@ -57,6 +57,11 @@ export function assembleEvidence(
       memoryType: chunk.metadata?.memory_type as string | undefined,
       reason: chunk.metadata?.reason as string | undefined,
       status: chunk.metadata?.status as string | undefined,
+      trust: chunk.metadata?.trust as string | undefined,
+      sourceSessionId: chunk.metadata?.source_session_id as string | undefined,
+      rootSessionId: chunk.metadata?.root_session_id as string | undefined,
+      sourceEventId: chunk.metadata?.source_event_id as string | undefined,
+      evidenceIds: chunk.metadata?.evidence_ids as string[] | undefined,
     };
   });
 

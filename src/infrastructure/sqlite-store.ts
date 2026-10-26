@@ -205,11 +205,13 @@ const INSERT_MEMORY = `
 const INSERT_KNOWLEDGE = `
   INSERT INTO memories (
     id, text, corpus, collection, fact_key, version_id,
-    valid_from, status, memory_type, source_ref, metadata, updated_at
-  ) VALUES (?, ?, 'knowledge', ?, ?, ?, datetime('now'), 'current', ?, ?, ?, datetime('now'))
+    valid_from, status, agent, memory_type, trust, source_ref, metadata, updated_at
+  ) VALUES (?, ?, 'knowledge', ?, ?, ?, datetime('now'), 'current', ?, ?, ?, ?, ?, datetime('now'))
   ON CONFLICT(id) DO UPDATE SET
     text = excluded.text,
+    agent = excluded.agent,
     memory_type = excluded.memory_type,
+    trust = excluded.trust,
     source_ref = excluded.source_ref,
     metadata = excluded.metadata,
     updated_at = datetime('now')
@@ -661,7 +663,8 @@ export class SqliteStore implements HydraDBLike {
 
         this.prepared(INSERT_KNOWLEDGE).run(
           id, text, input.collection ?? "default",
-          null, id, md.memory_type ?? null, doc.url ?? md.source_ref ?? null,
+          null, id, md.agent ?? null, md.memory_type ?? null, md.trust ?? null,
+          doc.url ?? md.source_ref ?? null,
           JSON.stringify({ ...md, source_ref: doc.url ?? md.source_ref, timestamp: doc.timestamp ?? md.timestamp }),
         );
         ids.push(id);
