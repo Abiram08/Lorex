@@ -18,11 +18,12 @@ server, and lifecycle hooks provide persistent memory and automatic capture.
 
 1. Identify the intended project root. Run all Lorex commands there so agents
    resolve the same workspace. Do not set up Lorex in a parent or unrelated repo.
-2. Check whether `lorex` is installed. If absent, install the published
-   `@lorex/cli` package globally with `npm install -g @lorex/cli`. If the npm
-   package is unavailable and this is the Lorex source checkout, build and
-   install that checkout with `npm install -g .`. Otherwise report that the
-   engine is missing; a SKILL.md file alone cannot run it.
+2. Check whether `lorex` is installed. If absent, run the published package as
+   `npx @lorex/cli` (not unscoped `npx lorex`). Its first run installs a
+   versioned runtime under `~/.lorex/runtime/` so generated hooks remain usable
+   after npx exits. If the npm package is unavailable and this is the Lorex
+   source checkout, build and install that checkout with `npm install -g .`.
+   Otherwise report that the engine is missing; a SKILL.md file alone cannot run it.
 3. Run `lorex help --json` to confirm the CLI is usable. Check
    `lorex hooks status`. If this project is not wired, run `lorex setup --yes`.
    This creates project scope, MCP connections, agent hooks, and a local
@@ -31,10 +32,10 @@ server, and lifecycle hooks provide persistent memory and automatic capture.
    hooks before claiming that memory is active. Restart the agents after setup.
    In Codex, open `/hooks` and trust the Lorex project hooks once.
 
-The global CLI install is needed for hooks to keep working without npm network
-access. A one-shot `npx` setup may leave later hooks dependent on npm cache or
-network. If installation or hook trust is unavailable, say which part is not
-active and continue the user's task without claiming automatic memory.
+A global CLI install is optional. One-shot npx setup must report an offline-safe
+managed runtime before claiming success; if that installation or agent hook
+trust is unavailable, say which part is not active and continue the user's task
+without claiming automatic memory.
 
 ## Work with the memory
 
