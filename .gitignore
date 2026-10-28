@@ -1,7 +1,5 @@
 node_modules/
-dist/
-!website/dist/
-!website/dist/**
+/dist/
 .env
 *.log
 .DS_Store
@@ -14,9 +12,25 @@ verify-graph.html
 longmemeval-*results*.json
 *.progress.jsonl
 *.tsbuildinfo
-.mcp.json
+/.mcp.json
 .tmp-npm-cache/
 *.tgz
+
+# Generated project-local Lorex and agent wiring
+/.lorex.json
+/AGENTS.md
+/opencode.json
+/.claude/settings.json
+/.claude/skills/lorex/
+/.codex/hooks.json
+/.cursor/hooks.json
+/.cursor/mcp.json
+/.grok/config.toml
+/.grok/hooks/lorex.json
+
+# Local research, analysis, and separate website checkout
+/docs/
+/website/
 
 # Local agent / dev tooling (except the distributable Lorex skill)
 .commandcode/
