@@ -45,7 +45,10 @@ function writeJson(path: string, data: unknown): void {
 }
 
 function hookExists(list: Array<Record<string, unknown>>, command: string): boolean {
-  return list.some((h) => JSON.stringify(h).includes(command));
+  return list.some((hook) => {
+    const handlers = (hook as { hooks?: Array<{ command?: unknown }> }).hooks;
+    return Array.isArray(handlers) && handlers.some((handler) => handler.command === command);
+  });
 }
 
 /** Our guidance blocks end with this marker, so idempotency and removal key off
@@ -71,7 +74,7 @@ function isLorexHook(hook: Record<string, unknown>): boolean {
     // Managed npx runtimes invoke `node <durable package>/dist/index.js`.
     // Require both the package path and harness verb so unrelated Node hooks
     // that merely live near a folder named Lorex are never removed.
-    return /(?:@lorex[\\/]cli|[\\/]\.lorex[\\/]runtime)[\\/].*dist[\\/]index\.js/i.test(h.command)
+    return /(?:@lorex[\\/]cli|[\\/]\.lorex[\\/]runtime|[\\/]lorex[\\/]).*dist[\\/]index\.js/i.test(h.command)
       && /\sharness\s+--agent(?:\s|$)/.test(h.command);
   });
 }

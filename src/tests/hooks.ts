@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkdtempSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { installHooks, isAgentSupported, hooksStatus, uninstallHooks, lorexBin } from "../interfaces/agent-hooks.js";
+import { lorexCommand } from "../infrastructure/runtime-command.js";
 import { runCli } from "../interfaces/cli.js";
 
 // Never let installer tests edit real agent configuration in the user's home.
@@ -41,8 +42,20 @@ function freshDir(): string {
   assert.ok(isAgentSupported("aider"));
   assert.ok(!isAgentSupported("not-an-agent"));
 
+  const command = lorexCommand();
   const bin = lorexBin();
-  assert.ok(bin === "lorex" || bin.startsWith("npx"), `bin resolves, got ${bin}`);
+  const directNodeEntry =
+    (command.source === "installed-package" || command.source === "managed-runtime") &&
+    command.command === process.execPath &&
+    command.args.length === 1 &&
+    command.args[0]!.endsWith(join("dist", "index.js")) &&
+    existsSync(command.args[0]!);
+  assert.ok(
+    (command.source === "global" && bin === "lorex") ||
+      (command.source === "npx" && bin === "npx -y @lorex/cli") ||
+      directNodeEntry,
+    `bin resolves to a runnable Lorex command, got ${bin}`,
+  );
   const oldNpmCommand = process.env.npm_command;
   process.env.npm_command = "exec";
   assert.equal(lorexBin(), "npx -y @lorex/cli", "npx's temporary PATH shim is never persisted as a global command");
