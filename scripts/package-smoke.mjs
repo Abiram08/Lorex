@@ -65,7 +65,7 @@ try {
   const lorexEntry = join(installDir, "node_modules", "@lorex", "cli", "dist", "index.js");
   if (!existsSync(lorexEntry)) throw new Error("packed package is missing dist/index.js");
   const installedRoot = join(installDir, "node_modules", "@lorex", "cli");
-  for (const required of ["LICENSE", join(".agents", "skills", "lorex", "SKILL.md"), join("console", "index.html"), join("console", "app.js"), join("console", "styles.css")]) {
+  for (const required of ["LICENSE", "CHANGELOG.md", "SECURITY.md", join(".agents", "skills", "lorex", "SKILL.md"), join("console", "index.html"), join("console", "app.js"), join("console", "styles.css")]) {
     if (!existsSync(join(installedRoot, required))) throw new Error(`packed package is missing ${required}`);
   }
   for (const removed of ["client.js", "interfaces/dashboard.js", "interfaces/graph-server.js", "interfaces/local-server.js"]) {

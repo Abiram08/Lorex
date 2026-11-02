@@ -275,14 +275,40 @@ The learning harness is designed for retries and interrupted agent sessions:
   preserve exact source text.
 - Hook failures identify the agent and event, fail open for the coding agent,
   and explain how to retry or diagnose Lorex.
+- Daemon hook jobs are committed to SQLite before `queued: true` is returned;
+  leases, retries, terminal failures, and restart recovery replace the old
+  in-memory Promise queue.
 
-Pattern learning runs behind session-count and time gates and reads historical
-observations without exposing superseded values to normal recall. It clusters
+Pattern learning runs behind session-count and time gates and reads up to
+50,000 historical observations directly, without FTS ranking or exposing
+superseded values to normal recall. The scan reports when that safety limit is
+reached. It clusters
 similar values before counting independent sessions, so a sequence such as
 Redis → Postgres → SQLite is learned as change history, not as a repeated Redis
 preference. Lower-confidence inferences enter a CLI-reviewable queue. Applied
 patterns use stable IDs, retain source IDs and `inferred_pattern` trust, and do
 not silently become user-stated facts.
+
+## Why SQLite remains the local engine
+
+Lorex keeps SQLite rather than requiring Postgres, DuckDB, LanceDB, or a local
+server. WAL transactions fit short concurrent hook writes, FTS5 handles lexical
+search, one file is easy to back up, and temporal claim updates can commit
+atomically. Server databases would weaken the zero-setup and offline guarantees;
+vector-only databases would still need a transactional source of truth.
+
+Retrieval scopes project and corpus inside the FTS index before ranking, tries a
+precise conjunctive plan before a broader fallback, and enforces a 10,000-row
+latency regression gate. The repository stress fixture dropped from tens of
+seconds to low tens of milliseconds on the development machine; the CI gate is
+conservatively set at two seconds. Existing stores migrate to the scoped index
+once instead of rebuilding FTS on every CLI invocation.
+
+Optional embeddings now contribute independent semantic candidates rather than
+only reranking lexical hits. The built-in exact vector scan is intentionally
+bounded for local stores; an optional SQLite vector extension can replace that
+adapter later if measured 50,000+ row workloads justify another native
+component. SQLite remains the authoritative evidence and claim store either way.
 
 ## Storage and privacy
 

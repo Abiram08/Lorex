@@ -47,18 +47,33 @@ versioning is [SemVer](https://semver.org/).
   inferences; `lorex review approve|decline <id>` resolves them without opening
   the browser console. Status and doctor now expose capture/evidence/fact/
   episode/pattern counts for the learning loop.
+- **Durable daemon work queue.** Hook capture and Dream jobs are inserted into
+  SQLite before the daemon acknowledges them, then processed with leases,
+  bounded retries, terminal failure state, restart recovery, and status counts.
+- **True hybrid candidate retrieval.** Optional embeddings can contribute rows
+  absent from lexical FTS candidates instead of only reranking the FTS top 50.
 
 ### Fixed
 - Updated the MCP SDK, Zod, and transitive production dependencies to patched
   versions; the production npm audit now reports zero known vulnerabilities.
 - Documentation no longer implies that a workspace name synchronizes the local
   SQLite store between machines.
+- **Scoped FTS retrieval was effectively quadratic.** Applying collection
+  filters outside an external-content FTS join made SQLite rescan the virtual
+  table for each project row: the 10k stress query took 22–38 seconds. Project
+  and corpus are now indexed FTS columns, candidate ranking is materialized
+  before lifecycle filtering, AND-first planning falls back to OR, and the same
+  fixture runs in low tens of milliseconds with a two-second regression gate.
+- FTS migration/rebuild is recorded and runs once; short-lived CLI commands no
+  longer rebuild the entire search index every time they open an existing DB.
 - **Dream could not learn from real version history.** Normal recall correctly
   hid superseded observations, but Dream used the same view, so repeated
   user-grounded evidence disappeared before pattern mining. Dream now reads
   historical memory, requires independent sessions, clusters equivalent values
   before counting, ignores agent reports/inferred patterns as training evidence,
-  and persists each inference under a stable ID.
+  and persists each inference under a stable ID. SQLite-backed Dream now scans
+  up to 50,000 historical observations directly instead of silently taking the
+  latest 500 ranked rows.
 - Completion hooks that omit a prompt turn ID now recover the newest staged
   prompt in the same project/session instead of dropping that turn.
 - Derived-memory `evidence_ids` now name actual stored transcript chunks rather
@@ -106,6 +121,11 @@ versioning is [SemVer](https://semver.org/).
   replacing whatever the user had with a one-key object.
 
 ### Changed
+- The application persistence port is now named `MemoryStore`; `HydraDBLike`
+  remains a deprecated compatibility alias while adapters migrate.
+- GitHub workflows use the Node 24-based v5 checkout/setup actions while the
+  package compatibility matrix continues to test Node.js 20 and 22.
+- Packed releases now include `CHANGELOG.md` and `SECURITY.md`.
 - `scripts/verify.mjs` runs against a throwaway `LOREX_HOME` (it used to delete
   the operator's real `~/.lorex/mock-store.json`) and derives server ports
   instead of hardcoding 3000/4321.

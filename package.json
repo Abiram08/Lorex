@@ -1,7 +1,7 @@
 {
   "name": "@lorex/cli",
   "version": "0.3.0",
-  "description": "Local-first memory for coding agents: temporal, causal, evidence-backed project memory with lifecycle, consolidation, and dream. SQLite by default.",
+  "description": "Local-first learning memory for coding agents: evidence-backed capture, temporal claims, fast retrieval, and cross-agent context.",
   "author": "Abiram08",
   "license": "MIT",
   "repository": {
@@ -52,7 +52,9 @@
     "dist",
     "console",
     ".agents/skills/lorex/SKILL.md",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "SECURITY.md"
   ],
   "keywords": [
     "mcp",
