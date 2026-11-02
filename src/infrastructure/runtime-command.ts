@@ -1,7 +1,7 @@
 /** Resolve a durable Lorex executable for generated MCP and hook configs. */
 
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { lorexHome } from "./paths.js";
@@ -63,6 +63,11 @@ export function lorexCommand(): LorexCommand {
     return { command: process.execPath, args: [entry], durable: true, source: "installed-package" };
   }
 
+  const packageEntry = join(packageRoot(), "dist", "index.js");
+  if (!isNpxInvocation() && existsSync(packageEntry)) {
+    return { command: process.execPath, args: [packageEntry], durable: true, source: "installed-package" };
+  }
+
   return { command: "npx", args: ["-y", "@lorex/cli"], durable: false, source: "npx" };
 }
 
@@ -95,6 +100,14 @@ function packageRoot(): string {
   return root;
 }
 
+function installedNodeModulesRoot(root: string): string | undefined {
+  const scope = dirname(root);
+  const candidate = dirname(scope);
+  return basename(candidate) === "node_modules" && existsSync(join(candidate, "better-sqlite3"))
+    ? candidate
+    : undefined;
+}
+
 /**
  * An npx package lives in an evictable npm cache. Before writing lifecycle
  * commands, install the exact running package into a versioned user runtime.
@@ -119,26 +132,35 @@ export function ensureDurableLorexCommand(): LorexCommand {
   const stage = `${finalRoot}.stage-${process.pid}-${Date.now()}`;
   try {
     const root = packageRoot();
-    // `npm pack <installed-package>` still runs its prepare script, but release
-    // tarballs intentionally omit the source build scripts. Pack a clean copy
-    // with lifecycle scripts removed instead of mutating the running package.
-    const packSource = join(packDir, "package");
-    cpSync(root, packSource, {
-      recursive: true,
-      filter: (source) => !relative(root, source).split(/[\\/]/).includes("node_modules"),
-    });
-    const manifestPath = join(packSource, "package.json");
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { scripts?: Record<string, string> };
-    delete manifest.scripts;
-    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
-    npmRun(["pack", packSource, "--pack-destination", packDir, "--ignore-scripts", "--silent"], packSource);
-    const tarball = readdirSync(packDir).find((name) => name.endsWith(".tgz"));
-    if (!tarball) throw new Error("npm pack did not produce the Lorex tarball");
+    const installedModules = installedNodeModulesRoot(root);
     mkdirSync(stage, { recursive: true });
-    npmRun([
-      "install", "--prefix", stage, "--omit=dev", "--no-audit", "--no-fund",
-      "--install-links", join(packDir, tarball),
-    ], root);
+    if (installedModules) {
+      // npx already installed and loaded a compatible dependency tree. Copy
+      // that exact tree instead of reinstalling native modules, which can fail
+      // when a future Node patch has no matching prebuild on a CI image.
+      cpSync(installedModules, join(stage, "node_modules"), {
+        recursive: true,
+        filter: (source) => !relative(installedModules, source).split(/[\\/]/).includes(".cache"),
+      });
+    } else {
+      // Source-checkout fallback for unusual direct invocations.
+      const packSource = join(packDir, "package");
+      cpSync(root, packSource, {
+        recursive: true,
+        filter: (source) => !relative(root, source).split(/[\\/]/).includes("node_modules"),
+      });
+      const manifestPath = join(packSource, "package.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { scripts?: Record<string, string> };
+      delete manifest.scripts;
+      writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + "\n");
+      npmRun(["pack", packSource, "--pack-destination", packDir, "--ignore-scripts", "--silent"], packSource);
+      const tarball = readdirSync(packDir).find((name) => name.endsWith(".tgz"));
+      if (!tarball) throw new Error("npm pack did not produce the Lorex tarball");
+      npmRun([
+        "install", "--prefix", stage, "--omit=dev", "--no-audit", "--no-fund",
+        "--install-links", join(packDir, tarball),
+      ], root);
+    }
     const stagedEntry = join(stage, "node_modules", "@lorex", "cli", "dist", "index.js");
     if (!existsSync(stagedEntry)) throw new Error("managed runtime is missing dist/index.js");
     rmSync(finalRoot, { recursive: true, force: true });

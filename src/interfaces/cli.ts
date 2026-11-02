@@ -295,7 +295,6 @@ async function cmdTask(args: string[]): Promise<void> {
 
 /** Connect this project to coding agents. Writes configs instead of printing snippets. */
 async function cmdWire(args: string[]): Promise<void> {
-  ensureDurableLorexCommand();
   const at = (name: string): string | undefined => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
@@ -317,6 +316,7 @@ async function cmdWire(args: string[]): Promise<void> {
   if (wantFileAgents) {
     const mcpPath = join(cwd, ".mcp.json");
     const existing = readJsonFile(mcpPath);
+    ensureDurableLorexCommand();
     const servers = (existing.mcpServers ?? {}) as Record<string, unknown>;
     servers.lorex = lorexMcpCommand("claude-code");
     existing.mcpServers = servers;
@@ -328,6 +328,7 @@ async function cmdWire(args: string[]): Promise<void> {
     const cursorPath = join(cwd, ".cursor", "mcp.json");
     mkdirSync(join(cwd, ".cursor"), { recursive: true });
     const existing = readJsonFile(cursorPath);
+    ensureDurableLorexCommand();
     const servers = (existing.mcpServers ?? {}) as Record<string, unknown>;
     servers.lorex = lorexMcpCommand("cursor");
     existing.mcpServers = servers;
@@ -339,6 +340,7 @@ async function cmdWire(args: string[]): Promise<void> {
     const codexPath = join(agentHome(), ".codex", "config.toml");
     mkdirSync(join(agentHome(), ".codex"), { recursive: true });
     const current = existsSync(codexPath) ? readFileSync(codexPath, "utf8") : "";
+    ensureDurableLorexCommand();
     const entry = lorexMcpCommand("codex");
     const block = `[mcp_servers.lorex]\ncommand = ${JSON.stringify(entry.command)}\nargs = ${JSON.stringify(entry.args)}\n`;
     const updated = upsertTomlSection(current, "mcp_servers.lorex", block);

@@ -131,6 +131,9 @@ try {
     LOREX_HOME: npxHome,
     LOREX_AGENT_HOME: npxAgentHome,
     npm_command: "exec",
+    // Managed setup must copy the already-working npx dependency tree rather
+    // than invoking npm and rebuilding native modules.
+    npm_execpath: join(scratch, "missing-npm.cjs"),
   };
   const npxSetup = lorex([], npxProject, npxEnv);
   const runtimeEntry = join(npxHome, "runtime", packageVersion, "node_modules", "@lorex", "cli", "dist", "index.js");

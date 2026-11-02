@@ -442,7 +442,8 @@ function jsonMcp(path: string, root: "mcpServers" | "mcp"): boolean {
 }
 
 function transientConfig(paths: string[]): boolean {
-  return paths.some((path) => existsSync(path) && /npx(?:\.cmd)?[\s\S]{0,200}@lorex[\\/]cli/i.test(readFileSync(path, "utf8")));
+  const transient = /(?:^|[\s"'=,:])npx(?:\.cmd)?(?=[\s"',])[\s\S]{0,200}@lorex[\\/]cli/i;
+  return paths.some((path) => existsSync(path) && transient.test(readFileSync(path, "utf8")));
 }
 
 function attributedConfig(path: string, agent: string): boolean {
