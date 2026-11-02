@@ -57,6 +57,25 @@ try {
   const relevant = await runHarnessEvent(engineA, { ...prompt, turn_id: "turn-2", prompt: "Why Redis for sessions?" }, "codex");
   assert.ok(relevant.includes("Redis"), "later prompt receives relevant learned context");
   assert.equal(await runHarnessEvent(engineA, { hook_event_name: "Stop", session_id: "codex-session-a", turn_id: "turn-1", last_assistant_message: "We decided to use Redis for session storage because it is local and fast." }, "codex"), "{}", "repeated stop is a no-op");
+
+  // Completion hooks do not always echo the prompt's turn id. The harness
+  // recovers the newest project/session-scoped prompt and learns a compact,
+  // explicitly non-authoritative episode backed by the exact source chunk.
+  await runHarnessEvent(engineA, {
+    hook_event_name: "UserPromptSubmit", session_id: "codex-no-stop-turn", turn_id: "generation-9",
+    prompt: "Please fix the retry race in the lifecycle harness.",
+  }, "codex");
+  assert.equal(await runHarnessEvent(engineA, {
+    hook_event_name: "Stop", session_id: "codex-no-stop-turn",
+    last_assistant_message: "Fixed the retry race with an atomic guard. All harness tests passed.",
+  }, "codex"), "{}", "Stop without a turn id pairs with the staged prompt");
+  const episodeRecall = await engineA.recall({ query: "retry race lifecycle harness", type: "memory" });
+  const episode = episodeRecall.sources.find((source) => source.trust === "assistant_report");
+  assert.ok(episode && episode.memory_type === "episode", "completed work is learned as an agent-reported episode");
+  const episodeEvidence = await engineA.recall({ query: "retry race lifecycle harness", type: "knowledge" });
+  assert.ok(episode.evidence_ids?.some((id) => episodeEvidence.sources.some((source) => source.id === id)),
+    "episode evidence ids resolve to exact stored transcript chunks");
+
   await runHarnessEvent(engineA, {
     hook_event_name: "UserPromptSubmit", session_id: "codex-compaction", turn_id: "turn-compact",
     prompt: "Should build artifacts stay local?", timestamp: "2026-02-01T12:00:00Z",

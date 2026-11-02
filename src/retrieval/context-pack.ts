@@ -17,6 +17,7 @@ const SECTIONS: Array<{ type: string; label: string }> = [
   { type: "constraint", label: "Constraints" },
   { type: "preference", label: "Preferences" },
   { type: "correction", label: "Corrections" },
+  { type: "episode", label: "Recent agent-reported outcomes" },
   { type: "handoff", label: "Handoffs" },
   { type: "task", label: "Open tasks" },
   { type: "fact", label: "Facts" },
@@ -52,6 +53,8 @@ function describe(source: ReceiptSource): string {
   const bits: string[] = [];
   if (source.valid_from) bits.push(String(source.valid_from).slice(0, 10));
   if (source.agent && source.agent !== "unknown") bits.push(`via ${source.agent}`);
+  if (source.trust === "assistant_report") bits.push("agent report; verify if critical");
+  if (source.trust === "inferred_pattern") bits.push("inferred pattern");
   if (source.source_ref) bits.push(String(source.source_ref).slice(0, 60));
   return bits.length ? ` _(${bits.join(" · ")})_` : "";
 }

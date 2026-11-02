@@ -894,6 +894,41 @@ export class SqliteStore implements HydraDBLike {
     return row?.n ?? 0;
   }
 
+  /** Observable learning-harness state for status/doctor. These counts keep
+   * raw evidence, extracted facts, agent reports, and inferences distinct. */
+  getLearningStats(collection: string): {
+    capturedSessions: number;
+    evidenceChunks: number;
+    extractedFacts: number;
+    reportedEpisodes: number;
+    inferredPatterns: number;
+  } {
+    this.init();
+    const row = this.db.prepare(
+      `SELECT
+         COUNT(DISTINCT CASE WHEN corpus = 'knowledge' AND memory_type = 'conversation_chunk'
+           THEN COALESCE(CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.root_session_id') END, source_ref) END) AS captured_sessions,
+         SUM(CASE WHEN corpus = 'knowledge' AND memory_type = 'conversation_chunk' THEN 1 ELSE 0 END) AS evidence_chunks,
+         SUM(CASE WHEN corpus = 'memory' AND trust = 'heuristic_extract' AND status != 'forgotten' THEN 1 ELSE 0 END) AS extracted_facts,
+         SUM(CASE WHEN corpus = 'memory' AND trust = 'assistant_report' AND status != 'forgotten' THEN 1 ELSE 0 END) AS reported_episodes,
+         SUM(CASE WHEN corpus = 'memory' AND trust = 'inferred_pattern' AND status != 'forgotten' THEN 1 ELSE 0 END) AS inferred_patterns
+       FROM memories WHERE collection = ?`,
+    ).get(collection) as {
+      captured_sessions: number | null;
+      evidence_chunks: number | null;
+      extracted_facts: number | null;
+      reported_episodes: number | null;
+      inferred_patterns: number | null;
+    };
+    return {
+      capturedSessions: Number(row.captured_sessions ?? 0),
+      evidenceChunks: Number(row.evidence_chunks ?? 0),
+      extractedFacts: Number(row.extracted_facts ?? 0),
+      reportedEpisodes: Number(row.reported_episodes ?? 0),
+      inferredPatterns: Number(row.inferred_patterns ?? 0),
+    };
+  }
+
   /**
    * Adjust retrieval signal for explicit memory ids.
    * Positive = useful (rank higher), negative = misleading (rank lower).

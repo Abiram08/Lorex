@@ -55,6 +55,67 @@ function metadataDate(chunk: QueryChunk, field: string): string | null {
   return typeof val === "string" && val ? val : null;
 }
 
+function observationSession(chunk: QueryChunk): string | undefined {
+  const value = chunk.metadata?.root_session_id ?? chunk.metadata?.source_session_id ?? chunk.metadata?.source_ref;
+  return typeof value === "string" && value ? value : undefined;
+}
+
+function wordSet(text: string): Set<string> {
+  return new Set(
+    text.toLowerCase()
+      .replace(/[^a-z0-9+#.-]+/g, " ")
+      .split(/\s+/)
+      .filter((word) => word.length >= 3 && !["the", "and", "for", "with", "that", "this", "because"].includes(word)),
+  );
+}
+
+function similarity(a: string, b: string): number {
+  const left = wordSet(a);
+  const right = wordSet(b);
+  if (!left.size || !right.size) return 0;
+  let shared = 0;
+  for (const word of left) if (right.has(word)) shared++;
+  return shared / Math.max(left.size, right.size);
+}
+
+function salientValue(chunk: QueryChunk): string | undefined {
+  const metadataValue = chunk.metadata?.to_value;
+  if (typeof metadataValue === "string" && metadataValue.trim()) return metadataValue.toLowerCase();
+  const text = chunk.text ?? "";
+  const match = text.match(
+    /\b(?:use|using|prefer|chose|selected|adopted|migrated to|switched to|replaced with)\s+(?:to use\s+)?([a-z0-9][\w.+#-]{1,40})/i,
+  );
+  return match?.[1]?.toLowerCase();
+}
+
+function equivalentObservation(a: QueryChunk, b: QueryChunk): boolean {
+  const leftValue = salientValue(a);
+  const rightValue = salientValue(b);
+  // One changed choice in an otherwise identical sentence is a new value, not
+  // confirming evidence (Redis → Postgres must remain history).
+  if (leftValue && rightValue && leftValue !== rightValue) return false;
+  return similarity(a.text ?? "", b.text ?? "") >= 0.72;
+}
+
+/** Cluster observations by meaning before counting sessions. A shared fact key
+ * alone is insufficient: Redis → Postgres → SQLite is a history, not a repeated
+ * preference for Redis. */
+function repeatedCluster(group: QueryChunk[]): { members: QueryChunk[]; sessions: Set<string> } | null {
+  const clusters: QueryChunk[][] = [];
+  for (const chunk of group) {
+    const cluster = clusters.find((candidate) => equivalentObservation(candidate[0]!, chunk));
+    if (cluster) cluster.push(chunk);
+    else clusters.push([chunk]);
+  }
+
+  let best: { members: QueryChunk[]; sessions: Set<string> } | null = null;
+  for (const members of clusters) {
+    const sessions = new Set(members.map(observationSession).filter((v): v is string => !!v));
+    if (!best || sessions.size > best.sessions.size) best = { members, sessions };
+  }
+  return best;
+}
+
 export async function dreamHeuristic(
   client: HydraDBLike,
   collection: string,
@@ -76,8 +137,11 @@ export async function dreamHeuristic(
     query: "",
     database: collection,
     collection,
+    type: "memory",
     max_results: 500,
-    metadata_filters: {},
+    // Pattern learning needs observations from prior versions. Normal recall
+    // correctly hides those versions; Dream deliberately studies the history.
+    metadata_filters: { include_superseded: true },
   });
 
   const chunks = queryResult.chunks;
@@ -86,26 +150,39 @@ export async function dreamHeuristic(
     return result;
   }
 
-  const byFactKey = groupByFactKey(chunks);
+  // Only user-grounded observations teach standing patterns. Agent-reported
+  // episodes remain useful for recall, but cannot bootstrap themselves into a
+  // durable preference; inferred patterns likewise cannot cite prior inferences.
+  const observations = chunks.filter((chunk) => {
+    const trust = String(chunk.metadata?.trust ?? "");
+    const type = String(chunk.metadata?.memory_type ?? "");
+    return trust !== "assistant_report" && trust !== "inferred_pattern" &&
+      type !== "conversation_chunk" && type !== "corpus_stats";
+  });
+  const byFactKey = groupByFactKey(observations);
 
   for (const [key, group] of byFactKey) {
-    // Repeated rows from one transcript are not independent observations.
-    const sessions = new Set(group.map((c) => c.metadata?.root_session_id ?? c.metadata?.source_session_id ?? c.metadata?.source_ref).filter(Boolean));
-    if (sessions.size < 3 || group.some((c) => String(c.metadata?.memory_type ?? "").startsWith("dream"))) continue;
-    const confidence = Math.min(1.0, 0.6 + (sessions.size - 3) * 0.05);
+    const repeated = repeatedCluster(group);
+    if (!repeated || repeated.sessions.size < 3) continue;
+    const confidence = Math.min(1.0, 0.6 + (repeated.sessions.size - 3) * 0.05);
     if (confidence < minConfidence) continue;
+    const representative = [...repeated.members].sort((a, b) =>
+      Date.parse(metadataDate(b, "valid_from") ?? metadataDate(b, "created_at") ?? "0") -
+      Date.parse(metadataDate(a, "valid_from") ?? metadataDate(a, "created_at") ?? "0")
+    )[0]!;
     result.discovered.push({
-      text: `Repeated pattern (${sessions.size} sessions): ${group[0].text}`,
+      text: `Observed across ${repeated.sessions.size} independent sessions: ${representative.text}`,
       factKey: `dream_pref_${key}`,
-      memoryType: "preference",
+      memoryType: representative.metadata?.memory_type === "preference" ? "preference" : "pattern",
       confidence,
       source: "frequency",
-      sourceIds: group.map((c) => c.id),
+      sourceIds: repeated.members.map((c) => c.id),
     });
   }
 
   for (const [key, group] of byFactKey) {
-    if (group.length < 2) continue;
+    const sessions = new Set(group.map(observationSession).filter((v): v is string => !!v));
+    if (group.length < 2 || sessions.size < 2) continue;
     const dates = group
       .map((c) => metadataDate(c, "valid_from") ?? metadataDate(c, "created_at"))
       .filter((d): d is string => !!d)
@@ -144,17 +221,6 @@ export async function dreamHeuristic(
     });
   }
 
-  result.discovered = result.discovered.slice(0, maxDiscoveries);
-
-  const unique = new Map<string, DreamMemory>();
-  for (const d of result.discovered) {
-    const existing = unique.get(d.factKey);
-    if (!existing || d.confidence > existing.confidence) {
-      unique.set(d.factKey, d);
-    }
-  }
-  result.discovered = Array.from(unique.values());
-
   for (const chunk of chunks) {
     const accessCount = (chunk.metadata?.access_count as number) ?? 0;
     if (accessCount >= 3) {
@@ -177,8 +243,17 @@ export async function dreamHeuristic(
     }
   }
 
+  const unique = new Map<string, DreamMemory>();
+  for (const discovery of result.discovered) {
+    const existing = unique.get(discovery.factKey);
+    if (!existing || discovery.confidence > existing.confidence) unique.set(discovery.factKey, discovery);
+  }
+  result.discovered = [...unique.values()].slice(0, maxDiscoveries);
+
   if (opts.consolidate !== false) {
-    const candidates: ConsolidationCandidate[] = chunks.map((c) => ({
+    const candidates: ConsolidationCandidate[] = chunks
+      .filter((c) => c.metadata?.status !== "superseded" && c.metadata?.status !== "forgotten")
+      .map((c) => ({
       id: c.id,
       factKey: (c.metadata?.fact_key as string) ?? c.id,
       text: c.text ?? "",

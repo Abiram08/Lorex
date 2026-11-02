@@ -29,17 +29,31 @@ export interface HookInput {
   timestamp?: string;
 }
 
-interface PendingTurn { prompt: string; turnId?: string; createdAt?: string }
+interface PendingTurn {
+  prompt: string;
+  sessionId?: string;
+  turnId?: string;
+  scope?: string;
+  createdAt?: string;
+}
+interface PendingMatch { turn: PendingTurn; file: string }
 const PENDING_TTL_MS = 7 * 24 * 60 * 60 * 1_000;
 
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 24);
 }
 
-function pendingFile(engine: LorexEngine, input: HookInput): string {
+function pendingScope(engine: LorexEngine): string {
   const identity = engine.getIdentity();
-  const dir = storeDir(loadConfig().dataDir);
-  return join(dir, "harness-pending", `${hash(`${identity.database}|${identity.collection}|${input.session_id}|${input.turn_id ?? "latest"}`)}.json`);
+  return hash(`${identity.database}|${identity.collection}`);
+}
+
+function pendingDirectory(): string {
+  return join(storeDir(loadConfig().dataDir), "harness-pending");
+}
+
+function pendingFile(engine: LorexEngine, input: HookInput): string {
+  return join(pendingDirectory(), `${hash(`${pendingScope(engine)}|${input.session_id}|${input.turn_id ?? "latest"}`)}.json`);
 }
 
 function stagePrompt(engine: LorexEngine, input: HookInput): void {
@@ -57,7 +71,9 @@ function stagePrompt(engine: LorexEngine, input: HookInput): void {
   const temp = `${file}.${process.pid}.tmp`;
   writeFileSync(temp, JSON.stringify({
     prompt: redactSecrets(input.prompt).text,
+    sessionId: input.session_id,
     turnId: input.turn_id,
+    scope: pendingScope(engine),
     // Keep the time the user supplied when the hook protocol has one. It makes
     // temporal recall reflect the conversation rather than a later Stop event.
     createdAt: validTimestamp(input.timestamp) ?? new Date().toISOString(),
@@ -81,33 +97,52 @@ function assistantResponse(input: HookInput): string | undefined {
   return candidates.find((value): value is string => typeof value === "string" && value.trim().length > 0)?.trim();
 }
 
-function discardPending(engine: LorexEngine, input: HookInput): void {
-  try { unlinkSync(pendingFile(engine, input)); } catch { /* no staged prompt */ }
+function discardPending(match: PendingMatch | null): void {
+  if (!match) return;
+  try { unlinkSync(match.file); } catch { /* another hook completed it */ }
 }
 
-function readPending(engine: LorexEngine, input: HookInput): PendingTurn | null {
-  const file = pendingFile(engine, input);
-  if (!existsSync(file)) return null;
+function parsePending(file: string): PendingMatch | null {
   try {
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as PendingTurn;
-    return typeof parsed.prompt === "string" ? parsed : null;
+    const turn = JSON.parse(readFileSync(file, "utf8")) as PendingTurn;
+    return typeof turn.prompt === "string" ? { turn, file } : null;
   } catch { return null; }
+}
+
+function readPending(engine: LorexEngine, input: HookInput): PendingMatch | null {
+  const exact = pendingFile(engine, input);
+  if (existsSync(exact)) return parsePending(exact);
+  if (!input.session_id) return null;
+
+  // Some hook protocols include a generation id on prompt submission but omit
+  // it on Stop/PreCompact. Recover the newest prompt for this exact project and
+  // session instead of silently dropping the completed turn.
+  const dir = pendingDirectory();
+  if (!existsSync(dir)) return null;
+  const matches = readdirSync(dir)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => parsePending(join(dir, name)))
+    .filter((match): match is PendingMatch => !!match)
+    .filter(({ turn }) => turn.scope === pendingScope(engine) && turn.sessionId === input.session_id)
+    .filter(({ turn }) => !input.turn_id || !turn.turnId || turn.turnId === input.turn_id)
+    .sort((a, b) => Date.parse(b.turn.createdAt ?? "0") - Date.parse(a.turn.createdAt ?? "0"));
+  return matches[0] ?? null;
 }
 
 async function captureHookTurn(engine: LorexEngine, input: HookInput, agent: string): Promise<boolean> {
   const pending = readPending(engine, input);
   const answer = assistantResponse(input);
-  if (!pending?.prompt.trim() || !answer) return false;
+  if (!pending?.turn.prompt.trim() || !answer) return false;
   const identity = engine.getIdentity();
-  const sessionId = `hook_${hash(`${agent}|${input.session_id}|${pending.turnId ?? pending.prompt}`)}`;
+  const sessionId = `hook_${hash(`${agent}|${input.session_id}|${pending.turn.turnId ?? pending.turn.prompt}`)}`;
   const turns = [
-    ...splitText(pending.prompt, "user", pending.createdAt),
+    ...splitText(pending.turn.prompt, "user", pending.turn.createdAt),
     ...splitText(redactSecrets(answer).text, "assistant", validTimestamp(input.timestamp)),
   ];
   const session = normalizeSession(sessionId, identity.database, identity.collection, turns, { agent, source: "hook" });
   const result = await engine.ingestSession(session);
   if (result.partial || result.errors.length) throw new Error(result.errors.join("; ") || "partial hook ingestion");
-  discardPending(engine, input);
+  discardPending(pending);
   return result.chunkCount > 0 || result.factCount > 0;
 }
 
@@ -190,7 +225,7 @@ export async function runHarnessEvent(engine: LorexEngine, input: HookInput, age
         if (!saved) throw new Error(result.errors.join("; "));
       } else {
         saved = result.chunkCount > 0 || result.factCount > 0;
-        discardPending(engine, input);
+        discardPending(readPending(engine, input));
       }
     // A compaction hook can include the completed response. Capture it now:
     // a later Stop hook may not have that response after compaction. If there

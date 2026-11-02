@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { normalizeSession, sessionToEvents } from "../ingestion/normalizer.js";
 import { chunkEvents } from "../ingestion/chunker.js";
 import { deduplicateEvents } from "../ingestion/deduplicator.js";
-import { extractFacts } from "../ingestion/extractor.js";
+import { extractEpisodes, extractFacts } from "../ingestion/extractor.js";
 import { classifyMemoryType } from "../domain/fact.js";
 import type { ConversationEvent } from "../domain/event.js";
 
@@ -102,6 +102,19 @@ function ev(role: "user" | "assistant", content: string, n = 0): ConversationEve
     ev("user", "Actually that's wrong, we use Memcached now, changed from Redis last week."),
   ]);
   assert.ok(corrections.some((f) => f.isCorrection), "correction flagged");
+
+  const episodes = extractEpisodes([
+    ev("user", "Please fix the retry race in the lifecycle harness.", 1),
+    ev("assistant", "Implemented an atomic retry guard. All 24 harness checks passed.", 2),
+  ]);
+  assert.equal(episodes.length, 1, "completed agent work becomes a compact episode");
+  assert.equal(episodes[0]?.memoryType, "episode");
+  assert.equal(episodes[0]?.trust, "assistant_report", "episodes never masquerade as user-grounded facts");
+  assert.deepEqual(episodes[0]?.sourceEventIds, ["e1", "e2"], "episode keeps both sides as provenance");
+  assert.equal(extractEpisodes([
+    ev("user", "Please fix the retry race.", 1),
+    ev("assistant", "I will implement a retry guard next.", 2),
+  ]).length, 0, "future promises are not learned as completed outcomes");
 }
 
 // ── Memory type classification ───────────────────────────────────────────────

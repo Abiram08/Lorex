@@ -335,6 +335,8 @@ import { detectLocalModels, resetLocalModelsCache } from "../infrastructure/loca
     await runCli(["profile"]);
     await runCli(["open-loops"]);
     await runCli(["dream"]);
+    const reviews = await captureOutput(() => runCli(["reviews"]));
+    assert.ok(reviews.includes("No inferred memories"), "review queue is accessible from the CLI");
     await runCli(["consolidate"]);
     await runCli(["doctor"]);
 
@@ -423,6 +425,7 @@ import { detectLocalModels, resetLocalModelsCache } from "../infrastructure/loca
   const missing = dispatched.filter((c) => !aliases.has(c) && !names.has(c));
   assert.deepEqual(missing, [], `commands missing from help --json: ${missing.join(", ")}`);
   assert.ok(names.has("reflect"), "reflect is discoverable through help --json");
+  assert.ok(names.has("reviews") && names.has("review"), "human inference review is discoverable through help --json");
   assert.ok(names.has("context"), "context is discoverable through help --json");
 }
 

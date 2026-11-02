@@ -1,6 +1,6 @@
 /** The Receipt contract returned by every operation, and the metadata schema version. */
 
-export const METADATA_SCHEMA_VERSION = 2;
+export const METADATA_SCHEMA_VERSION = 3;
 
 import type { CompressionStats } from "./compression.js";
 

@@ -17,8 +17,12 @@ export interface ExtractedFact {
   sessionId: string;
   occurredAt: string;
   confidence: number;
-  extractionMethod: "heuristic";
+  extractionMethod: "heuristic" | "llm" | "harness_episode";
+  /** Stored source ids. The pipeline replaces event ids with exact chunk ids. */
   evidenceIds: string[];
+  /** Event-level provenance retained after evidenceIds become stored chunk ids. */
+  sourceEventIds: string[];
+  trust: "heuristic_extract" | "assistant_report";
   isCorrection: boolean;
   supersedes?: string;
 }
@@ -59,6 +63,8 @@ export function extractFacts(events: ConversationEvent[]): ExtractedFact[] {
       confidence,
       extractionMethod: "heuristic",
       evidenceIds: [event.eventId],
+      sourceEventIds: [event.eventId],
+      trust: "heuristic_extract",
       isCorrection: memoryType === "correction",
     });
   }
@@ -162,8 +168,10 @@ export async function extractFactsWithLlm(
           sessionId: anchor.sessionId,
           occurredAt: anchor.occurredAt,
           confidence: Math.min(0.9, confidence),
-          extractionMethod: "heuristic",
+          extractionMethod: "llm",
           evidenceIds: [anchor.eventId],
+          sourceEventIds: [anchor.eventId],
+          trust: "heuristic_extract",
           isCorrection: memoryType === "correction",
         });
       }
@@ -175,6 +183,71 @@ export async function extractFactsWithLlm(
     console.warn(`lorex: LLM extraction partially failed (${(lastError as Error).message}); heuristic facts kept.`);
   }
   return base;
+}
+
+/**
+ * Compact, non-authoritative memories of completed work. Coding-agent replies
+ * often contain the only concise account of what happened ("fixed X; tests
+ * pass"). Keeping that account solely in a large transcript makes later recall
+ * fragile, but promoting it to a project fact would trust the agent too much.
+ * Episodes occupy the middle: searchable and short, explicitly marked as an
+ * assistant report, and never allowed to supersede user-grounded facts.
+ */
+export function extractEpisodes(events: ConversationEvent[]): ExtractedFact[] {
+  const episodes: ExtractedFact[] = [];
+  let latestUser: ConversationEvent | undefined;
+
+  for (const event of events) {
+    if (event.role === "user") {
+      latestUser = event;
+      continue;
+    }
+    if (event.role !== "assistant" || !latestUser || event.content.length < 20) continue;
+
+    const outcome = reportedOutcome(event.content);
+    if (!outcome) continue;
+    const task = compactLine(latestUser.content, 150);
+    const value = `Task: ${task}\nAgent-reported outcome: ${outcome}`.slice(0, 500);
+    const sourceEventIds = [latestUser.eventId, event.eventId];
+    episodes.push({
+      factKey: generateContentKey(`episode ${latestUser.sessionId} ${value}`),
+      value,
+      memoryType: "episode",
+      eventId: event.eventId,
+      sessionId: event.sessionId,
+      occurredAt: event.occurredAt,
+      confidence: 0.6,
+      extractionMethod: "harness_episode",
+      evidenceIds: sourceEventIds,
+      sourceEventIds,
+      trust: "assistant_report",
+      isCorrection: false,
+    });
+  }
+
+  return episodes;
+}
+
+const OUTCOME_SIGNAL =
+  /\b(implemented|fixed|resolved|completed|finished|added|removed|updated|refactored|migrated|configured|installed|created|wrote|built|shipped|deployed|verified|validated|tested|tests? pass(?:ed)?|checks? pass(?:ed)?|identified|found the (?:cause|issue|bug)|root cause)\b/i;
+const FUTURE_REPORT = /^\s*(?:i|we)\s*(?:will|'ll|am going to|are going to)\b/i;
+
+function reportedOutcome(text: string): string | undefined {
+  const candidates = text
+    .replace(/```[\s\S]*?```/g, " ")
+    .split(/(?<=[.!?])\s+|\n+/)
+    .map((line) => compactLine(line, 280))
+    .filter((line) => line.length >= 16);
+  const match = candidates.find((line) => OUTCOME_SIGNAL.test(line) && !FUTURE_REPORT.test(line));
+  return match || undefined;
+}
+
+function compactLine(text: string, max: number): string {
+  return text
+    .replace(/^\s*(?:[-*#>]+|\d+[.)])\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, max);
 }
 
 interface FactSignal {

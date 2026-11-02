@@ -411,16 +411,36 @@ async function remember(
 
 {
   const { store, done } = freshStore();
-  // Same fact_key ingested 3+ times → preference discovery
+  // Real extracted facts supersede prior rows. Dream must still study those
+  // historical observations rather than seeing only the latest version.
   for (let i = 0; i < 3; i++) {
     await store.ingestMemory({
       database: "dream_freq",
       collection: "dream_freq",
       memories: [{
         id: `pref_${i}`, text: "Always use TypeScript for new code",
-        additional_metadata: { fact_key: "lang_pref", version_id: `pref_${i}`, memory_type: "preference", source_session_id: `session_${i}` },
+        additional_metadata: {
+          fact_key: "lang_pref", version_id: `pref_${i}`, memory_type: "preference",
+          source_session_id: `session_${i}`, trust: "heuristic_extract", status: "current",
+          valid_from: `2026-01-0${i + 1}T00:00:00Z`,
+        },
       }],
     });
+  }
+  const visible = await store.query({ query: "TypeScript", database: "dream_freq", collection: "dream_freq", type: "memory" });
+  assert.equal(visible.chunks.filter((c) => c.metadata?.fact_key === "lang_pref").length, 1,
+    "ordinary recall sees only the current repeated observation");
+
+  // A changing topic is not a repeated pattern merely because its fact key is stable.
+  for (const [i, value] of ["Redis", "Postgres", "SQLite"].entries()) {
+    await store.ingestMemory({ database: "dream_freq", collection: "dream_freq", memories: [{
+      id: `db_${i}`, text: `We decided to use ${value} for sessions`,
+      additional_metadata: {
+        fact_key: "session_database", version_id: `db_${i}`, memory_type: "decision",
+        source_session_id: `db_session_${i}`, trust: "heuristic_extract", status: "current",
+        valid_from: `2026-02-0${i + 1}T00:00:00Z`,
+      },
+    }] });
   }
 
   const r = await dreamHeuristic(store, "dream_freq");
@@ -428,6 +448,8 @@ async function remember(
     r.discovered.some((d) => d.memoryType === "preference" && d.source === "frequency"),
     `expected a frequency preference discovery, got ${JSON.stringify(r.discovered)}`,
   );
+  assert.ok(!r.discovered.some((d) => d.factKey === "dream_pref_session_database"),
+    "three different values on one topic are a history, not a learned pattern");
   for (let i = 0; i < 3; i++) {
     await store.ingestMemory({ database: "dream_freq", collection: "dream_freq", memories: [{
       id: `same_${i}`, text: "Use one unsupported claim repeatedly",
@@ -638,13 +660,22 @@ async function remember(
 // ── Engine: dream persists discoveries ───────────────────────────────────────
 
 {
-  const { engine, done } = freshEngine("dream_eng");
-  for (let i = 0; i < 3; i++) {
-    await engine.remember(`Always run the test suite before commit attempt ${i}`, { id: `-commit_pref_${i}` });
+  const { engine, store, done } = freshEngine("dream_eng");
+  for (let i = 0; i < 7; i++) {
+    await store.ingestMemory({ database: "dream_eng", collection: "dream_eng", memories: [{
+      id: `commit_pref_${i}`, text: "Always run the test suite before committing",
+      additional_metadata: {
+        fact_key: "commit_preference", memory_type: "preference", source_session_id: `commit_session_${i}`,
+        trust: "heuristic_extract", status: "current", valid_from: `2026-03-0${i + 1}T00:00:00Z`,
+      },
+    }] });
   }
   const r = await engine.dream();
-  assert.ok(r.persisted >= 0, "dream runs without error");
+  assert.equal(r.persisted, 1, "high-confidence repeated evidence becomes one inferred pattern");
   assert.ok(r.durationMs >= 0);
+  await engine.dream();
+  assert.equal(store.getLearningStats("dream_eng").inferredPatterns, 1,
+    "repeated Dream runs update a stable inferred memory instead of duplicating it");
   done();
 }
 

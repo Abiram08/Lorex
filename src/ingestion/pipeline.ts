@@ -5,7 +5,7 @@ import type { NormalizedSession } from "../domain/session.js";
 import { sessionToEvents } from "./normalizer.js";
 import { chunkEvents, DEFAULT_CHUNK_TOKENS, type Chunk } from "./chunker.js";
 import { deduplicateEvents } from "./deduplicator.js";
-import { extractFacts, extractFactsWithLlm, llmExtractionEnabled, type ExtractedFact } from "./extractor.js";
+import { extractEpisodes, extractFacts, extractFactsWithLlm, llmExtractionEnabled, type ExtractedFact } from "./extractor.js";
 import { extractReason, extractTransition } from "../domain/causality.js";
 import { LIMITS, assertMaxLength } from "../infrastructure/limits.js";
 import { METADATA_SCHEMA_VERSION } from "../domain/receipts.js";
@@ -60,7 +60,7 @@ export async function ingestSession(
     maxTokens: options.maxTokensPerChunk ?? DEFAULT_CHUNK_TOKENS,
   });
 
-  let facts = extractFacts(uniqueEvents);
+  let facts = [...extractFacts(uniqueEvents), ...extractEpisodes(uniqueEvents)];
   // Tier 1 (opt-in): merge LLM-extracted facts under the heuristic baseline.
   if (llmExtractionEnabled()) {
     try {
@@ -69,6 +69,10 @@ export async function ingestSession(
       // Heuristic results stand on their own.
     }
   }
+  // Extractors operate on events, but durable receipts must point to rows that
+  // actually exist in the store. Resolve event provenance to the exact
+  // verbatim chunk ids before any derived memory is written.
+  facts = attachStoredEvidence(facts, chunks, events);
 
   let knowledgeIds: string[] = [];
   let memoryIds: string[] = [];
@@ -117,6 +121,25 @@ export async function ingestSession(
     errors,
     partial: errors.length > 0,
   };
+}
+
+function attachStoredEvidence(
+  facts: ExtractedFact[],
+  chunks: Chunk[],
+  events: ReturnType<typeof sessionToEvents>,
+): ExtractedFact[] {
+  const eventIndexes = new Map(events.map((event, index) => [event.eventId, index]));
+  return facts.map((fact) => {
+    const evidence = new Set<string>();
+    for (const eventId of fact.sourceEventIds) {
+      const index = eventIndexes.get(eventId);
+      if (index === undefined) continue;
+      for (const chunk of chunks) {
+        if (index >= chunk.eventStart && index <= chunk.eventEnd) evidence.add(chunk.chunkId);
+      }
+    }
+    return { ...fact, evidenceIds: [...evidence] };
+  });
 }
 
 async function storeChunks(
@@ -184,7 +207,11 @@ async function storeFacts(
     if (fact.confidence < MIN_PIPELINE_CONFIDENCE) continue;
     const value = redactSecrets(fact.value).text;
     const versionId = `${fact.factKey}_${fact.sessionId}_${fact.eventId}`;
-    const prior = index?.get(fact.factKey);
+    // Agent-reported episodes are useful recollections, not authoritative
+    // project state. They receive unique keys and must never close a user-
+    // grounded fact chain.
+    const canSupersede = fact.trust !== "assistant_report";
+    const prior = canSupersede ? index?.get(fact.factKey) : undefined;
     const supersedes =
       prior && Date.parse(prior.validFrom || "0") < Date.parse(fact.occurredAt || "0")
         ? prior
@@ -226,10 +253,11 @@ async function storeFacts(
       source_session_id: fact.sessionId,
       root_session_id: rootSessionId ?? fact.sessionId,
       source_event_id: fact.eventId,
+      source_event_ids: fact.sourceEventIds,
       source,
       agent,
       status: "current",
-      trust: "heuristic_extract",
+      trust: fact.trust,
     };
 
     items.push({
@@ -238,11 +266,13 @@ async function storeFacts(
       infer: true,
       relations: supersedes
         ? { ids: [supersedes.versionId], properties: { type: "supersedes", reason: reason ?? null } }
-        : undefined,
+        : fact.evidenceIds.length
+          ? { ids: fact.evidenceIds, properties: { type: "derives" } }
+          : undefined,
       additional_metadata: metadata,
     });
 
-    if (index) {
+    if (index && canSupersede) {
       const held = index.get(fact.factKey);
       if (!held || Date.parse(held.validFrom || "0") <= Date.parse(fact.occurredAt || "0")) {
         index.set(fact.factKey, {

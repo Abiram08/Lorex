@@ -234,9 +234,12 @@ async function cmdStatus(args: string[]): Promise<void> {
   const loops = client.getOpenLoops(identity.collection);
   const handoffs = client.topByType(identity.collection, "handoff");
   const profile = client.getProfile(identity.collection, "project");
+  const learning = client.getLearningStats(identity.collection);
 
   const parts = Object.entries(stats.byType).map(([t, n]) => `${n} ${t}`);
-  println(`Memory: ${stats.total} facts${parts.length ? ` (${parts.join(", ")})` : ""} · avg strength ${stats.avgStrength.toFixed(2)}`);
+  println(`Memory: ${stats.total} stored items${parts.length ? ` (${parts.join(", ")})` : ""} · avg strength ${stats.avgStrength.toFixed(2)}`);
+  println(`Learning harness: ${learning.capturedSessions} session(s) captured · ${learning.evidenceChunks} evidence chunk(s) · ` +
+    `${learning.extractedFacts} user-grounded fact(s) · ${learning.reportedEpisodes} agent-reported episode(s) · ${learning.inferredPatterns} inferred pattern(s)`);
   if (stats.staleCount) println(`Stale: ${stats.staleCount} weak · ${stats.expiredCount} expired-validity`);
   println(`Open loops: ${loops.length}${loops[0] ? ` — oldest: "${loops[0].text.slice(0, 80)}" (${loops[0].age_days}d)` : ""}`);
   println(`Handoff: ${handoffs[0] ? `"${handoffs[0].text.slice(0, 100)}"` : "none recorded"}`);
@@ -617,11 +620,17 @@ async function cmdDoctor(args: string[]): Promise<void> {
     getLifecycleStats(c: string): { total: number; byType: Record<string, number>; avgStrength: number; staleCount: number };
     getOpenLoops(c: string): Array<{ text: string; age_days: number }>;
     getQueryFailures(n?: number): Array<{ pattern: string; fails: number }>;
+    getLearningStats(c: string): { capturedSessions: number; evidenceChunks: number; extractedFacts: number; reportedEpisodes: number; inferredPatterns: number };
   }>;
   if (typeof store.getLifecycleStats === "function") {
     const stats = store.getLifecycleStats(identity.collection);
     const parts = Object.entries(stats.byType).map(([t, n]) => `${n} ${t}`).join(", ");
-    println(`  facts: ${stats.total}${parts ? ` (${parts})` : ""} · avg strength ${stats.avgStrength.toFixed(2)} · ${stats.staleCount} stale`);
+    println(`  stored: ${stats.total}${parts ? ` (${parts})` : ""} · avg strength ${stats.avgStrength.toFixed(2)} · ${stats.staleCount} stale`);
+    if (typeof store.getLearningStats === "function") {
+      const learning = store.getLearningStats(identity.collection);
+      println(`  learning: ${learning.capturedSessions} session(s) · ${learning.evidenceChunks} evidence chunk(s) · ` +
+        `${learning.extractedFacts} user-grounded fact(s) · ${learning.reportedEpisodes} agent-reported episode(s) · ${learning.inferredPatterns} inferred pattern(s)`);
+    }
     const loops = typeof store.getOpenLoops === "function" ? store.getOpenLoops(identity.collection) : [];
     println(`  open loops: ${loops.length}`);
     const gaps = typeof store.getQueryFailures === "function" ? store.getQueryFailures(3) : [];
@@ -886,6 +895,34 @@ async function cmdOneShot(op: string, args: string[]): Promise<void> {
           `reinforced ${r.reinforced.length}, flagged ${r.contradictions.length} contradictions.`,
         result: r,
       }, null));
+      return;
+    }
+    case "reviews": {
+      const rows = await engine.reviews();
+      if (args.includes("--json")) {
+        println(JSON.stringify({ op: "reviews", pending: rows.length, reviews: rows }, null, 2));
+        return;
+      }
+      if (!rows.length) {
+        println("No inferred memories are waiting for review.");
+        return;
+      }
+      println(`Pending inferred memories (${rows.length}):`);
+      for (const row of rows) {
+        const text = String(row.payload.text ?? row.payload.factKey ?? "inferred memory");
+        println(`- ${row.id} · ${Math.round(row.confidence * 100)}% · ${text}`);
+      }
+      println("Approve with `lorex review approve <id>` or decline with `lorex review decline <id>`. ");
+      return;
+    }
+    case "review": {
+      const action = args[0];
+      const id = args[1];
+      if ((action !== "approve" && action !== "decline") || !id) {
+        throw new Error("Usage: lorex review approve|decline <id>");
+      }
+      const result = await engine.resolveReview(id, action);
+      println(JSON.stringify({ op: "review", id, ...result }, null));
       return;
     }
     case "reflect": {
@@ -1340,6 +1377,8 @@ export const CLI_COMMANDS: CliCommandInfo[] = [
   { name: "why", summary: "Explain why a fact changed, from the recorded reasons", usage: "lorex why [--factId id] [--query text]" },
   { name: "handoff", summary: "Record a decision and the next step for the next agent", usage: 'lorex handoff --decision "..." [--next "..."]' },
   { name: "dream", summary: "Mine sessions for patterns; --auto respects the gates", usage: "lorex dream [--auto]" },
+  { name: "reviews", summary: "List inferred memories waiting for human review", usage: "lorex reviews [--json]" },
+  { name: "review", summary: "Approve or decline one inferred memory", usage: "lorex review approve|decline <id>" },
   { name: "consolidate", summary: "Apply expired TTLs; --prune also merges and prunes", usage: "lorex consolidate [--prune]" },
   { name: "open-loops", summary: "Tasks recorded but never acted on", usage: "lorex open-loops" },
   { name: "profile", summary: "Standing user/project state, no query needed", usage: "lorex profile [--kind user|project] [--refresh] [--plain]" },
@@ -1395,6 +1434,8 @@ export async function runCli(argv: string[]): Promise<void> {
     case "context": return cmdOneShot("context", rest);
     case "handoff": return cmdOneShot("handoff", rest);
     case "dream": return cmdOneShot("dream", rest);
+    case "reviews": return cmdOneShot("reviews", rest);
+    case "review": return cmdOneShot("review", rest);
     case "reflect": return cmdOneShot("reflect", rest);
     case "consolidate": return cmdOneShot("consolidate", rest);
     case "open-loops": return cmdOneShot("open-loops", rest);
@@ -1449,7 +1490,7 @@ Everything else — the full surface:
 Full list:
   setup · init · status · start · usage · learn · history
   list · resume · reflect · report · capture · forget · graph · why · handoff
-  dream · consolidate · open-loops · profile · export · import
+  dream · reviews · review · consolidate · open-loops · profile · export · import
 
 All commands run local-first (no key needed).
 

@@ -1364,7 +1364,9 @@ export class LorexEngine {
       database: this.identity.database,
       collection: this.identity.collection,
       memories: discoveries.map((d) => ({
-        id: `dream_${d.factKey}_${Date.now().toString(36)}`,
+        // Stable id makes repeated Dream runs update one inference instead of
+        // accumulating duplicate current memories for the same pattern.
+        id: `dream_${d.factKey}`,
         text: d.text,
         relations: d.sourceIds.length
           ? { ids: d.sourceIds.slice(0, 10), properties: { type: "derives" } }
