@@ -10,6 +10,47 @@ resident browser service. Core storage, retrieval, source receipts, temporal
 history, and abstention all run locally. Optional model and embedding endpoints
 can improve extraction or synthesis, but they are not required.
 
+## The learning harness
+
+Lorex is not only a place where an agent can manually save notes. Its lifecycle
+harness is a local learning loop that watches supported coding-agent sessions,
+preserves what actually happened, distills useful memory, and returns the right
+part to a later agent:
+
+```text
+prompt + response/transcript
+        ↓
+redact → normalize → exact evidence chunks
+        ↓
+user-grounded facts + agent-reported work episodes
+        ↓
+versioning, corrections, decay, feedback, pattern mining
+        ↓
+token-bounded context for the next prompt or agent
+```
+
+The distinction between evidence and belief is deliberate:
+
+- **Verbatim evidence** keeps the exact user and assistant text with session,
+  agent, timestamp, and source attribution.
+- **User-grounded facts** promote explicit decisions, preferences, constraints,
+  corrections, and stable project statements. These can update a fact's
+  temporal version chain.
+- **Agent-reported episodes** compactly remember completed work such as a fix or
+  passing validation. They are marked `assistant_report`, cite the exact stored
+  transcript chunks, and never supersede a user-grounded fact. Injected context
+  labels them as reports that should be verified when critical.
+- **Inferred patterns** require repeated evidence from independent sessions.
+  Lower-confidence patterns wait for approval instead of silently becoming
+  truth; inspect them with `lorex reviews` and decide with
+  `lorex review approve|decline <id>`.
+
+This makes Lorex a continuously learning project memory rather than a transcript
+archive: it remembers outcomes, learns repeated working preferences, adapts
+ranking from feedback, retains corrections over time, and still exposes the
+source behind every derived memory. The core loop is deterministic and local;
+optional models improve extraction but are not required for it to learn.
+
 ## What works today
 
 The product flow is implemented around one command:
@@ -153,6 +194,9 @@ lorex add "Sessions use Redis because Atlas timed out"
 lorex ask "What stores sessions?"
 lorex context "implement session cleanup" --plain --maxTokens 900
 lorex handoff --decision "Use Redis for sessions" --next "Add expiry tests"
+lorex dream                  # inspect newly mined cross-session patterns
+lorex reviews                # review lower-confidence inferred memories
+lorex review approve <id>    # or: lorex review decline <id>
 lorex doctor
 lorex hooks status
 ```
@@ -197,12 +241,13 @@ Lorex keeps exact source evidence and derived facts separate:
    timestamps, session identity, root session identity, and agent attribution.
 3. Credentials are redacted before prompts are staged or content is persisted.
 4. Exact conversation chunks are stored with `verbatim_source` trust.
-5. Only durable user-stated evidence is promoted into extracted facts.
-   Assistant prose remains verbatim history and is not treated as a verified
-   fact merely because an assistant said it.
-6. Facts retain evidence IDs, confidence, versions, supersession links,
-   validity windows, reasons, and source receipts.
-7. Recall returns supporting sources or abstains when evidence is missing.
+5. Only durable user-stated evidence is promoted into project facts.
+6. Completed assistant work can become a compact `assistant_report` episode,
+   but it remains non-authoritative, links to exact evidence chunks, and cannot
+   supersede user-grounded state.
+7. Facts retain stored evidence IDs, event provenance, confidence, versions,
+   supersession links, validity windows, reasons, and source receipts.
+8. Recall returns supporting sources or abstains when evidence is missing.
 
 Receipts expose agent, trust, source session, root session, source event, and
 evidence identifiers. Consumers can distinguish explicit memories, heuristic
@@ -219,7 +264,8 @@ The learning harness is designed for retries and interrupted agent sessions:
 - Duplicate Stop events are idempotent.
 - Pending prompts are written atomically and expire if a generation never
   completes.
-- Stop and PreCompact accept supported response-field aliases.
+- Stop and PreCompact accept supported response-field aliases and can recover
+  the correct staged prompt when a completion event omits its turn ID.
 - Long transcripts are processed in bounded batches.
 - Capture cursors advance only after complete writes.
 - Partial fact writes are retried instead of skipped.
@@ -230,9 +276,13 @@ The learning harness is designed for retries and interrupted agent sessions:
 - Hook failures identify the agent and event, fail open for the coding agent,
   and explain how to retry or diagnose Lorex.
 
-Pattern learning runs behind session-count and time gates. Lower-confidence
-inferences enter a review queue. Applied inferred memories retain their source
-IDs and `inferred_pattern` trust and do not silently become user-stated facts.
+Pattern learning runs behind session-count and time gates and reads historical
+observations without exposing superseded values to normal recall. It clusters
+similar values before counting independent sessions, so a sequence such as
+Redis → Postgres → SQLite is learned as change history, not as a repeated Redis
+preference. Lower-confidence inferences enter a CLI-reviewable queue. Applied
+patterns use stable IDs, retain source IDs and `inferred_pattern` trust, and do
+not silently become user-stated facts.
 
 ## Storage and privacy
 

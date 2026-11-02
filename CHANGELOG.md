@@ -40,12 +40,29 @@ versioning is [SemVer](https://semver.org/).
   session narrative ("today I debugged…") as `episode`, which expires in 30 days
   and decays twice as fast as a fact — session story no longer masquerades as
   durable project truth.
+- **Learning-harness outcomes.** Completed agent work is distilled into compact
+  `assistant_report` episodes linked to exact transcript chunks. Reports are
+  visibly labeled, decay as episodes, and cannot supersede user-grounded facts.
+- **Human review from the CLI.** `lorex reviews` lists lower-confidence Dream
+  inferences; `lorex review approve|decline <id>` resolves them without opening
+  the browser console. Status and doctor now expose capture/evidence/fact/
+  episode/pattern counts for the learning loop.
 
 ### Fixed
 - Updated the MCP SDK, Zod, and transitive production dependencies to patched
   versions; the production npm audit now reports zero known vulnerabilities.
 - Documentation no longer implies that a workspace name synchronizes the local
   SQLite store between machines.
+- **Dream could not learn from real version history.** Normal recall correctly
+  hid superseded observations, but Dream used the same view, so repeated
+  user-grounded evidence disappeared before pattern mining. Dream now reads
+  historical memory, requires independent sessions, clusters equivalent values
+  before counting, ignores agent reports/inferred patterns as training evidence,
+  and persists each inference under a stable ID.
+- Completion hooks that omit a prompt turn ID now recover the newest staged
+  prompt in the same project/session instead of dropping that turn.
+- Derived-memory `evidence_ids` now name actual stored transcript chunks rather
+  than internal event IDs; event provenance remains separately recorded.
 - **Global scope never superseded.** A `scope: global` write looked up and closed
   versions in the project collection instead of `global`, so user-level
   preferences accumulated as duplicate currents forever.
