@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { loadConfig, saveConfig, saveProjectWorkspace, saveActiveTask, projectConfigFile, projectRoot, defaultWorkspace, configFile, type Config } from "../infrastructure/config.js";
 import { lorexHome, storeDbPath } from "../infrastructure/paths.js";
 import { resolveIdentity } from "../infrastructure/identity.js";
-import { type HydraDBLike } from "../infrastructure/store.js";
+import { type MemoryStore } from "../infrastructure/store.js";
 import { MockHydraDB } from "../infrastructure/mock-hydradb.js";
 import { SqliteStore } from "../infrastructure/sqlite-store.js";
 import { LorexEngine } from "../engine.js";
@@ -489,7 +489,7 @@ function resolveLocalStorePath(config?: Config): string {
   return storeDbPath(config?.dataDir);
 }
 
-function buildClient(useMock: boolean, config: Config): HydraDBLike {
+function buildClient(useMock: boolean, config: Config): MemoryStore {
   // SQLite is the store. --mock falls back to the in-memory JSON backend.
   if (useMock && !process.argv.includes("--sqlite")) {
     return new MockHydraDB({ persistPath: join(lorexHome(), "mock-store.json") });

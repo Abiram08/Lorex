@@ -1,6 +1,6 @@
 /** Session ingestion pipeline and cross-session supersession linking. */
 
-import type { HydraDBLike, MemoryItem, IngestKnowledgeInput } from "../infrastructure/store.js";
+import type { MemoryStore, MemoryItem, IngestKnowledgeInput } from "../infrastructure/store.js";
 import type { NormalizedSession } from "../domain/session.js";
 import { sessionToEvents } from "./normalizer.js";
 import { chunkEvents, DEFAULT_CHUNK_TOKENS, type Chunk } from "./chunker.js";
@@ -37,7 +37,7 @@ export interface IngestionResult {
 }
 
 export async function ingestSession(
-  client: HydraDBLike,
+  client: MemoryStore,
   session: NormalizedSession,
   options: IngestionPipelineOptions,
 ): Promise<IngestionResult> {
@@ -143,7 +143,7 @@ function attachStoredEvidence(
 }
 
 async function storeChunks(
-  client: HydraDBLike,
+  client: MemoryStore,
   chunks: Chunk[],
   options: IngestionPipelineOptions,
   rootSessionId?: string,
@@ -187,7 +187,7 @@ async function storeChunks(
 }
 
 async function storeFacts(
-  client: HydraDBLike,
+  client: MemoryStore,
   facts: ExtractedFact[],
   options: IngestionPipelineOptions,
   rootSessionId?: string,

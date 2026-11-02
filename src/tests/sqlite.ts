@@ -66,6 +66,8 @@ async function remember(
 {
   const { store, done } = freshStore();
   await remember(store, "The deployment pipeline runs on Kubernetes", "t2", {}, "deploy");
+  await remember(store, "Evidence receipts are retained for every decision", "t2", {}, "receipts");
+  await remember(store, "Another project uses Kubernetes receipts", "other-project", {}, "isolated");
 
   // Porter stemming: "deploying" should match "deployment"
   const stemmed = await store.query({ query: "deploying pipeline", database: "t2", collection: "t2" });
@@ -74,6 +76,13 @@ async function remember(
   // Single-char terms can't form FTS prefixes → LIKE fallback path
   const fallback = await store.query({ query: "K", database: "t2", collection: "t2" });
   assert.ok(Array.isArray(fallback.chunks), "LIKE fallback must return an array");
+
+  // No single row contains both concepts, so conjunctive retrieval falls back
+  // to scoped OR retrieval without leaking the matching row from another project.
+  const expanded = await store.query({ query: "Kubernetes receipts", database: "t2", collection: "t2" });
+  assert.ok(expanded.chunks.some((chunk) => chunk.id === "deploy"));
+  assert.ok(expanded.chunks.some((chunk) => chunk.id === "receipts"));
+  assert.ok(!expanded.chunks.some((chunk) => chunk.id === "isolated"), "FTS scope stays inside the project collection");
 
   // Gibberish that matches nothing
   const empty = await store.query({ query: "xqzvwkj", database: "t2", collection: "t2" });
@@ -230,6 +239,20 @@ async function remember(
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE VIRTUAL TABLE memories_fts USING fts5(
+      text, fact_key, content=memories, content_rowid=rowid,
+      tokenize='porter unicode61'
+    );
+    CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+      INSERT INTO memories_fts(rowid, text, fact_key) VALUES (new.rowid, new.text, new.fact_key);
+    END;
+    CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, text, fact_key) VALUES ('delete', old.rowid, old.text, old.fact_key);
+    END;
+    CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, text, fact_key) VALUES ('delete', old.rowid, old.text, old.fact_key);
+      INSERT INTO memories_fts(rowid, text, fact_key) VALUES (new.rowid, new.text, new.fact_key);
+    END;
     INSERT INTO memories (id, text, collection) VALUES ('legacy', 'legacy fact', 'mig');
   `);
   raw.close();
@@ -243,6 +266,14 @@ async function remember(
   const stats = store.getLifecycleStats("mig");
   assert.equal(stats.total, 1);
   store.close();
+
+  const migrated = new Database(path, { readonly: true });
+  const ftsColumns = (migrated.prepare("PRAGMA table_info(memories_fts)").all() as Array<{ name: string }>).map((column) => column.name);
+  assert.ok(ftsColumns.includes("collection") && ftsColumns.includes("corpus") && ftsColumns.includes("status"),
+    "legacy FTS index migrates to scoped retrieval columns");
+  assert.ok(migrated.prepare("SELECT 1 FROM schema_migrations WHERE version = 'fts_v4_scoped'").get(),
+    "one-time FTS rebuild is recorded as a schema migration");
+  migrated.close();
 }
 
 // ── Relations round-trip ─────────────────────────────────────────────────────
@@ -261,6 +292,26 @@ async function remember(
 
   const rel = await store.contextRelations({ collection: "t8" }, ["v2"]);
   assert.ok((rel.relations ?? []).some((r) => r.source === "v2" && r.target === "v1"), "supersedes edge stored");
+  done();
+}
+
+// ── Durable background jobs ──────────────────────────────────────────────────
+
+{
+  const { store, done } = freshStore();
+  assert.equal(store.enqueueBackgroundJob("jobs", "job_one", "capture", { sessionId: "s1" }), true);
+  assert.equal(store.enqueueBackgroundJob("jobs", "job_one", "capture", { sessionId: "s1" }), false,
+    "idempotency key prevents duplicate acknowledged jobs");
+  const claimed = store.claimBackgroundJob("jobs");
+  assert.equal(claimed?.id, "job_one");
+  assert.equal(claimed?.attempts, 1);
+  store.completeBackgroundJob("job_one");
+  assert.equal(store.backgroundJobCounts("jobs").done, 1);
+
+  store.enqueueBackgroundJob("jobs", "job_failed", "capture", {});
+  const failed = store.claimBackgroundJob("jobs")!;
+  store.failBackgroundJob(failed.id, "permanent fixture failure", 5);
+  assert.equal(store.backgroundJobCounts("jobs").failed, 1, "fifth failure moves a job to the terminal queue");
   done();
 }
 
@@ -443,7 +494,22 @@ async function remember(
     }] });
   }
 
+  await store.ingestMemory({
+    database: "dream_freq",
+    collection: "dream_freq",
+    memories: Array.from({ length: 550 }, (_, i) => ({
+      id: `noise_${i}`,
+      text: `Unrelated one-off observation ${i}`,
+      additional_metadata: {
+        fact_key: `noise_${i}`, memory_type: "fact", source_session_id: `noise_session_${i}`,
+        trust: "heuristic_extract", status: "current",
+      },
+    })),
+  });
+
   const r = await dreamHeuristic(store, "dream_freq");
+  assert.ok(r.observationsScanned > 500, "Dream scans historical observations beyond the old top-500 window");
+  assert.equal(r.observationLimitReached, false);
   assert.ok(
     r.discovered.some((d) => d.memoryType === "preference" && d.source === "frequency"),
     `expected a frequency preference discovery, got ${JSON.stringify(r.discovered)}`,
@@ -783,6 +849,7 @@ async function remember(
   const queryMs = Date.now() - q0;
 
   assert.ok(q.chunks.length > 0, "stress store returns results");
+  assert.ok(queryMs < 2_000, `10k retrieval must stay interactive, got ${queryMs}ms`);
   console.log(`  stress: ${N} ingested in ${ingestMs}ms (${(N / (ingestMs / 1000)).toFixed(0)}/s), query ${queryMs}ms`);
 
   const stats = store.getLifecycleStats("stress");

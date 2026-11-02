@@ -21,7 +21,8 @@ import { SqliteStore } from "../infrastructure/sqlite-store.js";
 import { lorexHome, storeDbPath } from "../infrastructure/paths.js";
 import { RateLimitError } from "../infrastructure/rate-limiter.js";
 import { VERSION } from "../infrastructure/version.js";
-import { detectLocalModels } from "../infrastructure/local-models.js";
+import { detectLocalModels, type LocalModels } from "../infrastructure/local-models.js";
+import { providerFromConfig } from "../infrastructure/embeddings.js";
 import { renderGraphHtml } from "../interfaces/graph-render.js";
 import { hooksStatus, installHooks, uninstallHooks, isAgentSupported } from "../interfaces/agent-hooks.js";
 import { createServer as createMcpServer } from "../interfaces/mcp-server.js";
@@ -143,9 +144,21 @@ export async function startDaemonService(opts: DaemonOptions = {}): Promise<Daem
   const requestedPort = opts.port ?? loadConfig(bootCwd).daemonPort ?? 3777;
 
   // Best-effort: light up optional local embeddings / synthesis with zero config.
-  await detectLocalModels().catch(() => undefined);
+  // Keep the resolved provider explicit; detectLocalModels does not mutate env.
+  const localModels = await detectLocalModels().catch((): LocalModels => ({}));
+  const embeddingProvider = providerFromConfig({
+    url: localModels.embedUrl,
+    model: localModels.embedModel,
+    openAI: process.env.LOREX_EMBED_OPENAI === "1",
+    apiKey: process.env.LOREX_EMBED_API_KEY,
+  });
 
   const engines = new Map<string, LorexEngine>();
+  const stores = new Map<string, SqliteStore>();
+  const identityKey = (engine: LorexEngine): string => {
+    const identity = engine.getIdentity();
+    return `${identity.database}|${identity.collection}|${identity.agent}`;
+  };
   const engineFor = async (cwd: string, agent?: string): Promise<LorexEngine> => {
     const config = loadConfig(cwd);
     const workspace = config.workspace ?? process.env.LOREX_SPACE?.trim() ?? projectSpace(cwd);
@@ -159,21 +172,17 @@ export async function startDaemonService(opts: DaemonOptions = {}): Promise<Daem
     let engine = engines.get(key);
     if (!engine) {
       const store = new SqliteStore({ path: storeDbPath(config.dataDir) });
-      store.autoEmbedder();
+      store.setEmbedder(embeddingProvider);
       engine = new LorexEngine(store, identity);
       engines.set(key, engine);
+      stores.set(key, store);
     }
     await engine.ensureReady();
+    // Any request touching a workspace also resumes durable jobs left by a
+    // previous daemon process. queueMicrotask keeps request setup non-blocking.
+    queueMicrotask(() => void drainJobs(engine!));
     return engine;
   };
-
-  // Register the boot project as a space up front, so the console always has
-  // a "current space" to show (auto-named until the user confirms it).
-  try {
-    await (await engineFor(bootCwd)).ensureSpace();
-  } catch {
-    /* the console will surface the error state */
-  }
 
   const consoleDir = opts.consoleDir ?? join(dirname(fileURLToPath(import.meta.url)), "../../console");
   const startedAt = new Date().toISOString();
@@ -189,22 +198,66 @@ export async function startDaemonService(opts: DaemonOptions = {}): Promise<Daem
     }
   };
 
-  // ── Background job queue (hooks never block on capture/dream) ─────────────
+  // ── Durable background jobs (acknowledge only after SQLite commit) ────────
 
-  let queue: Promise<void> = Promise.resolve();
-  const enqueue = (name: string, task: () => Promise<string>): void => {
-    queue = queue
-      .then(async () => {
-        broadcast({ type: "job-start", name });
+  const draining = new Set<string>();
+  const drainJobs = async (engine: LorexEngine): Promise<void> => {
+    const key = identityKey(engine);
+    if (draining.has(key)) return;
+    const store = stores.get(key);
+    if (!store) return;
+    draining.add(key);
+    try {
+      let job;
+      while ((job = store.claimBackgroundJob(engine.getIdentity().collection))) {
+        broadcast({ type: "job-start", name: job.kind, id: job.id, attempt: job.attempts });
         try {
-          const summary = await task();
-          broadcast({ type: "job-done", name, summary });
+          let summary: string;
+          if (job.kind === "capture") {
+            const sessionId = String(job.payload.sessionId ?? "");
+            const prompt = String(job.payload.prompt ?? "");
+            const response = String(job.payload.response ?? "");
+            const agent = String(job.payload.agent ?? "unknown");
+            const occurredAt = typeof job.payload.occurredAt === "string" ? job.payload.occurredAt : undefined;
+            if (!sessionId || !prompt || !response) throw new Error("durable capture job is missing session evidence");
+            const identity = engine.getIdentity();
+            const captureId = `hook_${createHash("sha256").update(`${agent}|${sessionId}|${prompt}|${response}`).digest("hex").slice(0, 24)}`;
+            const session = normalizeSession(captureId, identity.database, identity.collection,
+              [{ role: "user", content: prompt }, { role: "assistant", content: response, occurredAt }],
+              { agent, source: "daemon-hook" });
+            const captured = await engine.ingestSession(session);
+            if (captured.partial || captured.errors.length) throw new Error(captured.errors.join("; ") || "partial hook capture");
+            summary = `captured ${captured.factCount} memories from ${captured.sessionId}`;
+            if (job.payload.withDream === true) {
+              const dream = await engine.dreamAuto();
+              if (dream.ran) summary += ` · dream: ${dream.result.discovered.length} patterns`;
+            }
+          } else if (job.kind === "dream") {
+            const dream = await engine.dreamAuto();
+            summary = dream.ran ? `dream: ${dream.result.discovered.length} patterns` : "dream: gates not met";
+          } else {
+            throw new Error(`unknown durable job kind: ${job.kind}`);
+          }
+          store.completeBackgroundJob(job.id);
+          broadcast({ type: "job-done", name: job.kind, id: job.id, summary });
         } catch (error) {
-          broadcast({ type: "job-error", name, error: (error as Error).message });
+          const message = (error as Error).message;
+          store.failBackgroundJob(job.id, message, job.attempts);
+          broadcast({ type: "job-error", name: job.kind, id: job.id, error: message, attempt: job.attempts });
+          if (job.attempts < 5) {
+            const retry = setTimeout(() => void drainJobs(engine), Math.min(60_000, 2 ** job.attempts * 1_000));
+            retry.unref();
+          }
         }
-      })
-      .catch(() => undefined);
+      }
+    } finally {
+      draining.delete(key);
+    }
   };
+
+  const bootEngine = await engineFor(bootCwd);
+  try { await bootEngine.ensureSpace(); } catch { /* the console surfaces it */ }
+  void drainJobs(bootEngine);
 
   // ── Request handling ──────────────────────────────────────────────────────
 
@@ -270,6 +323,7 @@ export async function startDaemonService(opts: DaemonOptions = {}): Promise<Daem
       const identity = engine.getIdentity();
       const spaces = await engine.listSpaces();
       const space = spaces?.find((s) => s.id === identity.collection) ?? null;
+      const jobs = stores.get(identityKey(engine))?.backgroundJobCounts(identity.collection) ?? {};
       return json(res, 200, {
         ok: true,
         version: VERSION,
@@ -286,6 +340,7 @@ export async function startDaemonService(opts: DaemonOptions = {}): Promise<Daem
         memories: spaces?.reduce((sum, s) => sum + s.memories, 0) ?? 0,
         currentMemories: space?.memories ?? 0,
         usage: engine.usage,
+        jobs,
         dream: await engine.dreamStatus(),
       });
     }
@@ -479,40 +534,39 @@ export async function startDaemonService(opts: DaemonOptions = {}): Promise<Daem
           body.prompt.length > 40_000 || response.length > 40_000) {
         return json(res, 400, { error: "sessionId, prompt and a completed response (each <= 40000 chars) are required; response, last_assistant_message, assistant_message, and text are accepted" });
       }
-      // Keep narrowed request values outside the asynchronous queue closure.
       const sessionId = body.sessionId;
       const prompt = body.prompt;
       const completedResponse = response;
       const hookCwd = body.cwd ?? bootCwd;
       const withDream = path.endsWith("/stop");
-      enqueue(path.slice("/v1/hooks/".length), async () => {
-        const engine = await engineFor(hookCwd, body.agent);
-        const identity = engine.getIdentity();
-        const captureId = `hook_${createHash("sha256").update(`${body.agent ?? "unknown"}|${sessionId}|${prompt}|${completedResponse}`).digest("hex").slice(0, 24)}`;
-        const session = normalizeSession(captureId, identity.database, identity.collection,
-          [{ role: "user", content: prompt }, { role: "assistant", content: completedResponse, occurredAt }],
-          { agent: body.agent ?? "unknown", source: "daemon-hook" });
-        const captured = await engine.ingestSession(session);
-        if (captured.partial || captured.errors.length) throw new Error(captured.errors.join("; ") || "partial hook capture");
-        let summary = `captured ${captured.factCount} facts from ${captured.sessionId}`;
-        if (withDream) {
-          const dream = await engine.dreamAuto();
-          if (dream.ran) summary += ` · dream: ${dream.result.discovered.length} patterns`;
-        }
-        return summary;
+      const engine = await engineFor(hookCwd, body.agent);
+      const store = stores.get(identityKey(engine));
+      if (!store) return json(res, 503, { error: "durable job store unavailable" });
+      const jobId = `capture_${createHash("sha256").update(
+        `${body.agent ?? "unknown"}|${sessionId}|${prompt}|${completedResponse}|${withDream}`,
+      ).digest("hex").slice(0, 24)}`;
+      store.enqueueBackgroundJob(engine.getIdentity().collection, jobId, "capture", {
+        sessionId,
+        prompt,
+        response: completedResponse,
+        occurredAt,
+        agent: body.agent ?? "unknown",
+        withDream,
       });
-      return json(res, 200, { queued: true });
+      void drainJobs(engine);
+      return json(res, 200, { queued: true, job_id: jobId, durable: true });
     }
 
     if (method === "POST" && path === "/v1/hooks/dream") {
       const body = (await readJson<{ cwd?: string; agent?: string }>(req)) ?? {};
       const hookCwd = body.cwd ?? bootCwd;
-      enqueue("dream", async () => {
-        const engine = await engineFor(hookCwd, body.agent);
-        const dream = await engine.dreamAuto();
-        return dream.ran ? `dream: ${dream.result.discovered.length} patterns` : "dream: gates not met";
-      });
-      return json(res, 200, { queued: true });
+      const engine = await engineFor(hookCwd, body.agent);
+      const store = stores.get(identityKey(engine));
+      if (!store) return json(res, 503, { error: "durable job store unavailable" });
+      const jobId = `dream_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      store.enqueueBackgroundJob(engine.getIdentity().collection, jobId, "dream", {});
+      void drainJobs(engine);
+      return json(res, 200, { queued: true, job_id: jobId, durable: true });
     }
 
     if (method === "GET" && path === "/resume") {
@@ -722,10 +776,8 @@ export async function startDaemonService(opts: DaemonOptions = {}): Promise<Daem
     }
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    for (const engine of engines.values()) {
-      try {
-        (engine as unknown as { client?: { close?: () => void } }).client?.close?.();
-      } catch { /* best effort */ }
+    for (const store of stores.values()) {
+      try { store.close(); } catch { /* best effort */ }
     }
   };
 

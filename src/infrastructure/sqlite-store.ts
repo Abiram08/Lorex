@@ -7,7 +7,7 @@ import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type {
-  HydraDBLike,
+  MemoryStore,
   IngestMemoryInput,
   IngestKnowledgeInput,
   IngestResult,
@@ -34,6 +34,30 @@ import {
   type EmbedProvider,
 } from "./embeddings.js";
 import { spaceLabel, type SpaceRow } from "./store.js";
+import { planFtsQueries } from "../retrieval/fts-query.js";
+
+const FTS_SCHEMA = `
+  CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    text, fact_key, collection, corpus, status,
+    content=memories, content_rowid=rowid,
+    tokenize='porter unicode61'
+  );
+
+  CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, text, fact_key, collection, corpus, status)
+    VALUES (new.rowid, new.text, new.fact_key, new.collection, new.corpus, new.status);
+  END;
+  CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, text, fact_key, collection, corpus, status)
+    VALUES ('delete', old.rowid, old.text, old.fact_key, old.collection, old.corpus, old.status);
+  END;
+  CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, text, fact_key, collection, corpus, status)
+    VALUES ('delete', old.rowid, old.text, old.fact_key, old.collection, old.corpus, old.status);
+    INSERT INTO memories_fts(rowid, text, fact_key, collection, corpus, status)
+    VALUES (new.rowid, new.text, new.fact_key, new.collection, new.corpus, new.status);
+  END;
+`;
 
 const SCHEMA = `
   CREATE TABLE IF NOT EXISTS memories (
@@ -61,22 +85,7 @@ const SCHEMA = `
     updated_at    TEXT DEFAULT (datetime('now'))
   );
 
-  CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-    text, fact_key,
-    content=memories, content_rowid=rowid,
-    tokenize='porter unicode61'
-  );
-
-  CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-    INSERT INTO memories_fts(rowid, text, fact_key) VALUES (new.rowid, new.text, new.fact_key);
-  END;
-  CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, text, fact_key) VALUES ('delete', old.rowid, old.text, old.fact_key);
-  END;
-  CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-    INSERT INTO memories_fts(memories_fts, rowid, text, fact_key) VALUES ('delete', old.rowid, old.text, old.fact_key);
-    INSERT INTO memories_fts(rowid, text, fact_key) VALUES (new.rowid, new.text, new.fact_key);
-  END;
+  ${FTS_SCHEMA}
 
   CREATE TABLE IF NOT EXISTS relations (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +110,24 @@ const SCHEMA = `
     pattern    TEXT PRIMARY KEY,
     fails      INTEGER DEFAULT 1,
     last_at    TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    TEXT PRIMARY KEY,
+    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS background_jobs (
+    id           TEXT PRIMARY KEY,
+    collection   TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'queued',
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT,
+    available_at TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
   CREATE TABLE IF NOT EXISTS profiles (
@@ -176,6 +203,7 @@ const INDEXES = `
   CREATE INDEX IF NOT EXISTS idx_reviews_collection_status ON review_queue(collection, status, created_at);
   CREATE INDEX IF NOT EXISTS idx_spaces_archived ON spaces(archived_at);
   CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(collection, task_id, seq);
+  CREATE INDEX IF NOT EXISTS idx_background_jobs_queue ON background_jobs(collection, status, available_at, created_at);
 `;
 
 const INSERT_MEMORY = `
@@ -231,12 +259,18 @@ const SELECT_BY_IDS = (count: number) => {
 };
 
 const SELECT_FTS = (where: string) => `
-  SELECT m.*, fts.rank AS score
-  FROM memories_fts fts
-  JOIN memories m ON m.rowid = fts.rowid
+  WITH ranked AS MATERIALIZED (
+    SELECT rowid, bm25(memories_fts, 1.0, 0.5, 0.0, 0.0, 0.0) AS score
+    FROM memories_fts
+    WHERE memories_fts MATCH ?
+    ORDER BY score
+    LIMIT ?
+  )
+  SELECT m.*, ranked.score AS score
+  FROM ranked
+  JOIN memories m ON m.rowid = ranked.rowid
   ${where}
-  AND memories_fts MATCH ?
-  ORDER BY fts.rank
+  ORDER BY ranked.score
   LIMIT ?
 `;
 
@@ -265,6 +299,13 @@ const SIGNAL_WEIGHT = 0.15;
 /** Weight of semantic similarity in the final retrieval score. */
 const SEMANTIC_WEIGHT = 0.2;
 
+export interface BackgroundJobRow {
+  id: string;
+  kind: string;
+  payload: Record<string, unknown>;
+  attempts: number;
+}
+
 export interface ReviewRow {
   id: string;
   collection: string;
@@ -282,32 +323,6 @@ function parseSignalIds(groundTruth: unknown): string[] {
   const ids = (groundTruth as Record<string, unknown>).source_ids;
   if (!Array.isArray(ids)) return [];
   return ids.filter((id): id is string => typeof id === "string" && id.length > 0);
-}
-
-const SYNONYMS: Record<string, string> = {
-  db: "database",
-  postgres: "postgresql",
-  psql: "postgresql",
-  mongo: "mongodb",
-  k8s: "kubernetes",
-  js: "javascript",
-  ts: "typescript",
-  golang: "go",
-  repo: "repository",
-  auth: "authentication",
-  config: "configuration",
-  docs: "documentation",
-  perf: "performance",
-  deploy: "deployment",
-};
-
-function expandTerms(query: string): string {
-  const words = query.replace(/[^\w\s]/g, " ").split(/\s+/).filter((t) => t.length > 1);
-  const expanded = words.flatMap((w) => {
-    const syn = SYNONYMS[w.toLowerCase()];
-    return syn && syn !== w.toLowerCase() ? [`${w}*`, `${syn}*`] : [`${w}*`];
-  });
-  return [...new Set(expanded)].join(" OR ");
 }
 
 function normalizeFtsScore(rank: number): number {
@@ -333,7 +348,7 @@ export interface SqliteStoreOptions {
   readOnly?: boolean;
 }
 
-export class SqliteStore implements HydraDBLike {
+export class SqliteStore implements MemoryStore {
   /** Fact-version replacement is committed in the same transaction as insertion. */
   readonly atomicVersioning = true;
   private db: Database.Database;
@@ -341,6 +356,71 @@ export class SqliteStore implements HydraDBLike {
   private embedder: EmbedProvider | null = null;
 
   private stmts = new Map<string, Database.Statement>();
+
+  /** Persist acknowledged daemon work before returning queued=true. */
+  enqueueBackgroundJob(
+    collection: string,
+    id: string,
+    kind: string,
+    payload: Record<string, unknown>,
+  ): boolean {
+    this.init();
+    this.db.prepare(`DELETE FROM background_jobs WHERE status = 'done' AND updated_at < datetime('now', '-7 days')`).run();
+    const result = this.db.prepare(
+      `INSERT OR IGNORE INTO background_jobs (id, collection, kind, payload) VALUES (?, ?, ?, ?)`,
+    ).run(id, collection, kind, JSON.stringify(payload));
+    return result.changes > 0;
+  }
+
+  claimBackgroundJob(collection: string): BackgroundJobRow | null {
+    this.init();
+    return this.db.transaction(() => {
+      // A process may die after claiming. Its lease becomes eligible again.
+      this.db.prepare(
+        `UPDATE background_jobs SET status = 'queued', updated_at = datetime('now')
+         WHERE collection = ? AND status = 'running' AND updated_at < datetime('now', '-5 minutes')`,
+      ).run(collection);
+      const row = this.db.prepare(
+        `SELECT id, kind, payload, attempts FROM background_jobs
+         WHERE collection = ? AND status = 'queued' AND available_at <= datetime('now')
+         ORDER BY created_at ASC LIMIT 1`,
+      ).get(collection) as { id: string; kind: string; payload: string; attempts: number } | undefined;
+      if (!row) return null;
+      const claimed = this.db.prepare(
+        `UPDATE background_jobs SET status = 'running', attempts = attempts + 1, updated_at = datetime('now')
+         WHERE id = ? AND status = 'queued'`,
+      ).run(row.id);
+      if (!claimed.changes) return null;
+      let payload: Record<string, unknown> = {};
+      try { payload = JSON.parse(row.payload); } catch { /* handler will reject missing fields */ }
+      return { id: row.id, kind: row.kind, payload, attempts: row.attempts + 1 };
+    })();
+  }
+
+  completeBackgroundJob(id: string): void {
+    this.init();
+    this.db.prepare(
+      `UPDATE background_jobs SET status = 'done', last_error = NULL, updated_at = datetime('now') WHERE id = ?`,
+    ).run(id);
+  }
+
+  failBackgroundJob(id: string, error: string, attempts: number): void {
+    this.init();
+    const terminal = attempts >= 5;
+    const delaySeconds = Math.min(60, 2 ** Math.max(0, attempts - 1));
+    this.db.prepare(
+      `UPDATE background_jobs SET status = ?, last_error = ?,
+         available_at = datetime('now', ?), updated_at = datetime('now') WHERE id = ?`,
+    ).run(terminal ? "failed" : "queued", error.slice(0, 1000), `+${delaySeconds} seconds`, id);
+  }
+
+  backgroundJobCounts(collection: string): Record<string, number> {
+    this.init();
+    const rows = this.db.prepare(
+      `SELECT status, COUNT(*) AS count FROM background_jobs WHERE collection = ? GROUP BY status`,
+    ).all(collection) as Array<{ status: string; count: number }>;
+    return Object.fromEntries(rows.map((row) => [row.status, row.count]));
+  }
 
   /** Task events are append-only: concurrent agents never overwrite each other's progress. */
   createTask(collection: string, id: string, brief: string): void {
@@ -435,19 +515,30 @@ export class SqliteStore implements HydraDBLike {
     } catch { /* ignore */ }
   }
 
-  /** Cosine similarity of a query vector against cached row vectors. */
-  private semanticScores(queryVec: number[], ids: string[]): Map<string, number> {
-    const out = new Map<string, number>();
-    if (!this.embedder) return out;
+  /** Semantic candidates across the scoped store, not merely lexical hits.
+   * This is an exact scan intended for local stores; an ANN adapter can replace
+   * it later without changing query orchestration. */
+  private semanticCandidates(
+    queryVec: number[],
+    where: string,
+    params: unknown[],
+    limit: number,
+  ): Array<{ row: Row; similarity: number }> {
+    if (!this.embedder) return [];
     const rows = this.db.prepare(
-      `SELECT id, vec FROM embeddings WHERE model = ? AND id IN (${ids.map(() => "?").join(",")})`,
-    ).all(this.embedder.model, ...ids) as Array<{ id: string; vec: Buffer }>;
-    for (const r of rows) {
-      try {
-        out.set(r.id, cosineSimilarity(queryVec, fromBlob(r.vec)));
-      } catch { /* corrupt vector: skip */ }
-    }
-    return out;
+      `SELECT m.*, 0.0 AS score, e.vec AS embedding_vec
+       FROM embeddings e JOIN memories m ON m.id = e.id
+       ${where} AND e.model = ?
+       LIMIT 50000`,
+    ).all(...params, this.embedder.model) as Array<Row & { embedding_vec: Buffer }>;
+    return rows
+      .map((row) => {
+        try { return { row, similarity: cosineSimilarity(queryVec, fromBlob(row.embedding_vec)) }; }
+        catch { return { row, similarity: 0 }; }
+      })
+      .filter((candidate) => candidate.similarity > 0)
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, limit);
   }
 
   private init(): void {
@@ -467,8 +558,12 @@ export class SqliteStore implements HydraDBLike {
     const existing = new Set(
       (this.db.prepare(`PRAGMA table_info(memories)`).all() as Array<{ name: string }>).map((c) => c.name),
     );
+    let memoriesChanged = false;
     const addColumn = (name: string, ddl: string) => {
-      if (!existing.has(name)) this.db.exec(`ALTER TABLE memories ADD COLUMN ${ddl}`);
+      if (!existing.has(name)) {
+        this.db.exec(`ALTER TABLE memories ADD COLUMN ${ddl}`);
+        memoriesChanged = true;
+      }
     };
     // Every column ever added, oldest first — DBs from any version migrate.
     addColumn("corpus", `corpus TEXT NOT NULL DEFAULT 'memory'`);
@@ -491,9 +586,36 @@ export class SqliteStore implements HydraDBLike {
     addColumn("relations", `relations TEXT DEFAULT '[]'`);
     addColumn("created_at", `created_at TEXT DEFAULT (datetime('now'))`);
     addColumn("updated_at", `updated_at TEXT DEFAULT (datetime('now'))`);
-    // Rows inserted before the FTS table existed are invisible to MATCH.
-    // Rebuild is idempotent and cheap on small stores.
-    this.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`);
+
+    // v4 retrieval index: scope collection/corpus inside FTS itself. Filtering
+    // an external-content FTS join by collection made SQLite choose the normal
+    // collection index first and rescan the virtual table once per row (tens of
+    // seconds at 10k memories). Recreate legacy two-column indexes once.
+    const ftsColumns = new Set(
+      (this.db.prepare(`PRAGMA table_info(memories_fts)`).all() as Array<{ name: string }>).map((column) => column.name),
+    );
+    let ftsRecreated = false;
+    if (!["collection", "corpus", "status"].every((column) => ftsColumns.has(column))) {
+      this.db.exec(`
+        DROP TRIGGER IF EXISTS memories_ai;
+        DROP TRIGGER IF EXISTS memories_ad;
+        DROP TRIGGER IF EXISTS memories_au;
+        DROP TABLE IF EXISTS memories_fts;
+        ${FTS_SCHEMA}
+      `);
+      ftsRecreated = true;
+    }
+
+    // Rebuild once per schema generation, not on every short-lived CLI process.
+    // Rebuilding a mature FTS index during every recall turns startup into an
+    // O(history) operation and can dominate query latency.
+    const ftsMigration = "fts_v4_scoped";
+    const applied = this.db.prepare(`SELECT 1 FROM schema_migrations WHERE version = ?`).get(ftsMigration);
+    if (!applied || ftsRecreated || memoriesChanged) {
+      this.db.exec(`INSERT INTO memories_fts(memories_fts) VALUES('rebuild')`);
+      this.db.prepare(`INSERT OR REPLACE INTO schema_migrations (version, applied_at) VALUES (?, datetime('now'))`)
+        .run(ftsMigration);
+    }
   }
 
   private prepared(sql: string): Database.Statement {
@@ -707,6 +829,7 @@ export class SqliteStore implements HydraDBLike {
   }
 
   async query(input: QueryInput): Promise<QueryResult> {
+    const startedAt = Date.now();
     this.init();
     const collection = input.collection ?? "default";
     const maxResults = input.max_results ?? 15;
@@ -742,19 +865,31 @@ export class SqliteStore implements HydraDBLike {
     // discarded most of its requested learning window.
     const limit = Math.min(maxResults * 3, 500);
 
-    const rows = query ? this.searchFts(query, where, params, limit) : this.searchRecent(where, params, limit);
+    const rows = query
+      ? this.searchFts(query, where, params, limit, collections, input.type)
+      : this.searchRecent(where, params, limit);
 
-    // Semantic rerank when an embedder is configured (best-effort, 2.5s cap).
+    // Hybrid retrieval: semantic candidates are unioned with lexical candidates
+    // before reranking, so embeddings can recover a relevant memory even when
+    // it shares no query words. Exact vector scan is bounded to 50k local rows.
     let semantic = new Map<string, number>();
     let semanticActive = false;
-    if (query && this.embedder && rows.length) {
+    if (query && this.embedder) {
       try {
         const vecs = await Promise.race([
           this.embedder.embed([query.slice(0, 2000)]),
           new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timeout")), 2500)),
         ]);
         if (vecs[0]) {
-          semantic = this.semanticScores(vecs[0], rows.slice(0, 50).map((r) => r.id));
+          const candidates = this.semanticCandidates(vecs[0], where, params, limit);
+          const seen = new Set(rows.map((row) => row.id));
+          for (const candidate of candidates) {
+            semantic.set(candidate.row.id, candidate.similarity);
+            if (!seen.has(candidate.row.id)) {
+              rows.push(candidate.row);
+              seen.add(candidate.row.id);
+            }
+          }
           semanticActive = semantic.size > 0;
         }
       } catch { /* FTS scores stand alone */ }
@@ -797,7 +932,12 @@ export class SqliteStore implements HydraDBLike {
       chunks.push(...this.expandRelations(chunks, collection, maxResults));
     }
 
-    return { chunks, requestId: `req_${Date.now().toString(36)}`, latencyMs: 0, raw: { engine: "sqlite", path: this.opts.path, semantic: semanticActive } };
+    return {
+      chunks,
+      requestId: `req_${Date.now().toString(36)}`,
+      latencyMs: Date.now() - startedAt,
+      raw: { engine: "sqlite", path: this.opts.path, semantic: semanticActive },
+    };
   }
 
   /** 1-hop relation expansion for thinking mode, weighted by edge type. */
@@ -828,12 +968,31 @@ export class SqliteStore implements HydraDBLike {
     return out;
   }
 
-  private searchFts(query: string, where: string, params: unknown[], limit: number) {
-    const terms = expandTerms(query);
-    if (!terms) return this.searchLike(query, where, params, limit);
+  private searchFts(
+    query: string,
+    where: string,
+    params: unknown[],
+    limit: number,
+    collections: string[],
+    type?: QueryInput["type"],
+  ): Row[] {
+    const plans = planFtsQueries(query, collections, type);
+    if (!plans.length) return this.searchLike(query, where, params, limit);
+
+    const candidateLimit = Math.min(2_000, Math.max(200, limit * 8));
+    const run = (ftsQuery: string): Row[] => this.db.prepare(SELECT_FTS(where)).all(
+      ftsQuery,
+      candidateLimit,
+      ...params,
+      limit,
+    ) as Row[];
 
     try {
-      return this.db.prepare(SELECT_FTS(where)).all(...params, terms, limit) as Row[];
+      // Conjunctive retrieval is both more precise and dramatically faster for
+      // broad project vocabularies. Fall back to OR only when no document
+      // contains every meaningful query concept.
+      const precise = run(plans[0]!);
+      return precise.length || plans.length === 1 ? precise : run(plans[1]!);
     } catch {
       return this.searchLike(query, where, params, limit);
     }
@@ -892,6 +1051,49 @@ export class SqliteStore implements HydraDBLike {
          AND (? IS NULL OR created_at > datetime(?))`,
     ).get(collection, sinceIso, sinceIso) as { n: number } | undefined;
     return row?.n ?? 0;
+  }
+
+  /** Historical learner input without FTS ranking or current-version filters.
+   * Dream needs prior observations that ordinary recall intentionally hides. */
+  scanLearningObservations(collection: string, limit = 50_000): { chunks: QueryChunk[]; truncated: boolean } {
+    this.init();
+    const bounded = Math.max(1, Math.min(100_000, Math.floor(limit)));
+    const rows = this.db.prepare(
+      `SELECT m.*, 0.0 AS score FROM memories m
+       WHERE m.collection = ? AND m.corpus = 'memory' AND m.status != 'forgotten'
+       ORDER BY m.created_at DESC LIMIT ?`,
+    ).all(collection, bounded + 1) as Row[];
+    const truncated = rows.length > bounded;
+    const chunks = rows.slice(0, bounded).map((row) => {
+      let metadata: Record<string, unknown> = {};
+      try { metadata = JSON.parse(row.metadata); } catch { /* legacy metadata */ }
+      return {
+        id: row.id,
+        text: row.text,
+        content: row.text,
+        corpus: "memory" as const,
+        score: 0,
+        metadata: {
+          ...metadata,
+          fact_key: row.fact_key,
+          version_id: row.version_id,
+          valid_from: row.valid_from,
+          valid_to: row.valid_to,
+          status: row.status,
+          agent: row.agent,
+          reason: row.reason,
+          memory_type: row.memory_type,
+          trust: row.trust,
+          source_ref: row.source_ref,
+          strength: row.strength,
+          access_count: row.access_count,
+          last_accessed: row.last_accessed,
+          created_at: row.created_at,
+          signal: row.signal ?? 0,
+        },
+      } satisfies QueryChunk;
+    });
+    return { chunks, truncated };
   }
 
   /** Observable learning-harness state for status/doctor. These counts keep

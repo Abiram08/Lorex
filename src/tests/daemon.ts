@@ -136,6 +136,8 @@ try {
     assistant_message: "Recorded the task event design.",
   });
   assert.equal(queuedCapture.queued, true);
+  assert.equal(queuedCapture.durable, true, "queued=true is returned only after the job is persisted");
+  assert.equal(typeof queuedCapture.job_id, "string");
   let captured = false;
   for (let i = 0; i < 20; i++) {
     const result = await getJson("/v1/memories?query=append-only%20task%20events");
@@ -166,11 +168,14 @@ try {
   const status = (await getJson("/v1/status")) as {
     ok: boolean;
     currentMemories: number;
+    jobs: Record<string, number>;
     spaces: { current: { id: string } | null };
   };
   assert.equal(status.ok, true);
   assert.ok(status.currentMemories >= 1, "status counts the current space's memories");
   assert.ok(status.spaces.current, "status reports the current space");
+  assert.ok(Object.values(status.jobs).reduce((sum, count) => sum + count, 0) >= 1,
+    "status exposes persisted background-job state");
 
   const reviews = (await getJson("/v1/reviews")) as { items: unknown[] };
   assert.deepEqual(reviews.items, [], "review queue starts empty");

@@ -1,7 +1,7 @@
 /** In-process store for offline demos and tests. */
 
 import {
-  HydraDBLike,
+  MemoryStore,
   IngestMemoryInput,
   IngestKnowledgeInput,
   IngestResult,
@@ -107,7 +107,7 @@ function jaccard(a: Set<string>, b: Set<string>): number {
   return inter / (a.size + b.size - inter);
 }
 
-export class MockHydraDB implements HydraDBLike {
+export class MockHydraDB implements MemoryStore {
   private memories: StoredMemory[] = [];
   private feedbacks: FeedbackRecord[] = [];
   private databases = new Set<string>();
@@ -415,6 +415,25 @@ export class MockHydraDB implements HydraDBLike {
       requestId: `req_${Math.random().toString(36).slice(2, 12)}`,
       latencyMs: input.mode === "thinking" ? 240 : 60,
       raw: {},
+    };
+  }
+
+  scanLearningObservations(collection: string, limit = 50_000): { chunks: QueryChunk[]; truncated: boolean } {
+    this.refresh();
+    const bounded = Math.max(1, Math.min(100_000, Math.floor(limit)));
+    const matches = this.memories
+      .filter((memory) => memory.collection === collection && memory.corpus === "memory" && memory.metadata.status !== "forgotten")
+      .sort((a, b) => (parseDate(b.timestamp) ?? 0) - (parseDate(a.timestamp) ?? 0));
+    return {
+      truncated: matches.length > bounded,
+      chunks: matches.slice(0, bounded).map((memory) => ({
+        id: memory.id,
+        text: memory.text,
+        content: memory.text,
+        corpus: "memory",
+        score: 0,
+        metadata: { ...memory.metadata, valid_from: memory.metadata.valid_from ?? memory.timestamp },
+      })),
     };
   }
 

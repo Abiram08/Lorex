@@ -11,6 +11,7 @@ import {
   toBlob,
   fromBlob,
   providerFromEnv,
+  providerFromConfig,
   openAIProvider,
   type EmbedProvider,
 } from "../infrastructure/embeddings.js";
@@ -31,6 +32,8 @@ import { resolveIdentity } from "../infrastructure/identity.js";
 
   delete process.env.LOREX_EMBED_URL;
   assert.equal(providerFromEnv(), null, "no URL means disabled");
+  assert.equal(providerFromConfig({}), null, "explicit config without a URL stays disabled");
+  assert.equal(providerFromConfig({ url: "http://localhost:11434", model: "embed-local" })?.model, "embed-local");
 }
 
 {
@@ -52,6 +55,7 @@ import { resolveIdentity } from "../infrastructure/identity.js";
 function fakeEmbedder(): EmbedProvider {
   const dims: Record<string, number[]> = {
     database: [1, 0, 0, 0],
+    persistence: [1, 0, 0, 0],
     cache: [0, 1, 0, 0],
     auth: [0, 0, 1, 0],
   };
@@ -87,6 +91,9 @@ function fakeEmbedder(): EmbedProvider {
   const q = await store.query({ query: "database postgres", database: "d", collection: "emb" });
   assert.ok(q.chunks.length >= 1, "hybrid query returns results");
   assert.equal((q.raw as Record<string, unknown>).semantic, true, "semantic active in raw");
+
+  const semanticOnly = await store.query({ query: "persistence layer", database: "d", collection: "emb" });
+  assert.equal(semanticOnly.chunks[0]?.id, "db_fact", "semantic candidates can recover a row with no lexical overlap");
 
   const cached = (store as unknown as { db: import("better-sqlite3").Database }).db
     .prepare(`SELECT COUNT(*) AS n FROM embeddings`).get() as { n: number };

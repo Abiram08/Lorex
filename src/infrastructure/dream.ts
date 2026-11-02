@@ -1,6 +1,6 @@
 /** Dream: background pattern extraction from session history. Heuristic, no LLM needed. */
 
-import type { HydraDBLike, QueryChunk } from "./store.js";
+import type { MemoryStore, QueryChunk } from "./store.js";
 import {
   planConsolidation,
   type ConsolidationCandidate,
@@ -11,6 +11,8 @@ export interface DreamResult {
   reinforced: string[];
   contradictions: DreamContradiction[];
   consolidationCandidates: { pruned: number; expired: number };
+  observationsScanned: number;
+  observationLimitReached: boolean;
   durationMs: number;
 }
 
@@ -117,7 +119,7 @@ function repeatedCluster(group: QueryChunk[]): { members: QueryChunk[]; sessions
 }
 
 export async function dreamHeuristic(
-  client: HydraDBLike,
+  client: MemoryStore,
   collection: string,
   opts: DreamOptions = {},
 ): Promise<DreamResult> {
@@ -130,21 +132,30 @@ export async function dreamHeuristic(
     reinforced: [],
     contradictions: [],
     consolidationCandidates: { pruned: 0, expired: 0 },
+    observationsScanned: 0,
+    observationLimitReached: false,
     durationMs: 0,
   };
 
-  const queryResult = await client.query({
-    query: "",
-    database: collection,
-    collection,
-    type: "memory",
-    max_results: 500,
-    // Pattern learning needs observations from prior versions. Normal recall
-    // correctly hides those versions; Dream deliberately studies the history.
-    metadata_filters: { include_superseded: true },
-  });
-
-  const chunks = queryResult.chunks;
+  let chunks: QueryChunk[];
+  if (typeof client.scanLearningObservations === "function") {
+    const scan = client.scanLearningObservations(collection, 50_000);
+    chunks = scan.chunks;
+    result.observationLimitReached = scan.truncated;
+  } else {
+    const queryResult = await client.query({
+      query: "",
+      database: collection,
+      collection,
+      type: "memory",
+      max_results: 500,
+      // Remote adapters without a learner scan retain the bounded fallback.
+      metadata_filters: { include_superseded: true },
+    });
+    chunks = queryResult.chunks;
+    result.observationLimitReached = chunks.length >= 500;
+  }
+  result.observationsScanned = chunks.length;
   if (chunks.length === 0) {
     result.durationMs = Date.now() - start;
     return result;

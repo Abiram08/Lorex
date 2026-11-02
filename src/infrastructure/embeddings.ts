@@ -71,14 +71,28 @@ export function openAIProvider(url: string, model: string, apiKey?: string): Emb
   };
 }
 
+export function providerFromConfig(input: {
+  url?: string;
+  model?: string;
+  openAI?: boolean;
+  apiKey?: string;
+}): EmbedProvider | null {
+  if (!input.url) return null;
+  const model = input.model?.trim() || "nomic-embed-text";
+  return input.openAI
+    ? openAIProvider(input.url, model, input.apiKey)
+    : ollamaProvider(input.url, model);
+}
+
 /** Provider from env. Ollama-style unless LOREX_EMBED_OPENAI=1. Null = disabled. */
 export function providerFromEnv(): EmbedProvider | null {
   const { url, model } = embedConfigFromEnv();
-  if (!url) return null;
-  if (process.env.LOREX_EMBED_OPENAI === "1") {
-    return openAIProvider(url, model, process.env.LOREX_EMBED_API_KEY);
-  }
-  return ollamaProvider(url, model);
+  return providerFromConfig({
+    url,
+    model,
+    openAI: process.env.LOREX_EMBED_OPENAI === "1",
+    apiKey: process.env.LOREX_EMBED_API_KEY,
+  });
 }
 
 export function cosineSimilarity(a: number[], b: number[]): number {

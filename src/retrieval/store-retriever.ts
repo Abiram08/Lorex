@@ -1,6 +1,6 @@
 /** Store query wrapper with error classification. */
 
-import type { HydraDBLike, QueryInput, QueryResult, QueryChunk } from "../infrastructure/store.js";
+import type { MemoryStore, QueryInput, QueryResult, QueryChunk } from "../infrastructure/store.js";
 import { HydraDBError } from "../infrastructure/store.js";
 
 export interface RetrieveOptions {
@@ -26,7 +26,7 @@ export interface RetrieveResult {
 }
 
 export async function retrieve(
-  client: HydraDBLike,
+  client: MemoryStore,
   options: RetrieveOptions,
 ): Promise<RetrieveResult> {
   const input: QueryInput = {

@@ -19,7 +19,14 @@ export function spaceLabel(id: string): string {
   return id;
 }
 
-export interface HydraDBLike {
+export interface LearningObservationScan {
+  chunks: QueryChunk[];
+  truncated: boolean;
+}
+
+/** Persistence/search port used by the application layer. The historical
+ * HydraDBLike name remains as an alias while adapters migrate. */
+export interface MemoryStore {
   createDatabase(database: string): Promise<void>;
   awaitDatabaseReady(database: string, maxAttempts?: number, intervalMs?: number): Promise<void>;
   databaseStatus(database: string): Promise<{ ready: boolean; raw: unknown }>;
@@ -35,7 +42,13 @@ export interface HydraDBLike {
   listSpaces?(): Promise<SpaceRow[]>;
   upsertSpace?(input: { id: string; name?: string; description?: string; source?: string }): Promise<void>;
   patchSpace?(id: string, patch: { name?: string; description?: string; archived?: boolean }): Promise<boolean>;
+  /** Direct historical scan for the incremental learner. Unlike normal recall,
+   * this includes superseded observations and does not rank through FTS. */
+  scanLearningObservations?(collection: string, limit?: number): LearningObservationScan;
 }
+
+/** @deprecated Import MemoryStore in new code. */
+export type HydraDBLike = MemoryStore;
 
 export interface ContextScope {
   database?: string;

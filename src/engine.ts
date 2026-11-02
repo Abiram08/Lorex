@@ -2,7 +2,7 @@
 
 import {
   spaceLabel,
-  type HydraDBLike,
+  type MemoryStore,
   type MemoryItem,
   type QueryChunk,
   type FeedbackInput,
@@ -189,7 +189,7 @@ export class LorexEngine {
   }
 
   constructor(
-    private readonly client: HydraDBLike,
+    private readonly client: MemoryStore,
     private readonly identity: Identity,
     sharedLimiter?: RateLimiter,
   ) {

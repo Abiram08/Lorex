@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import { classifyAndPlan } from "../retrieval/planner.js";
 import { assembleEvidence, synthesizeTimeline, synthesizeAnswer } from "../retrieval/evidence-assembler.js";
 import { buildContextPack } from "../retrieval/context-pack.js";
+import { planFtsQueries } from "../retrieval/fts-query.js";
 import { determineAbstention } from "../synthesis/abstention.js";
 import type { QueryChunk } from "../infrastructure/store.js";
 import type { ReceiptSource } from "../domain/receipts.js";
@@ -32,6 +33,18 @@ function chunk(id: string, text: string, corpus: "memory" | "knowledge" = "memor
   const asOf = classifyAndPlan("anything", { asOf: "2023-01-01T00:00:00Z" });
   assert.equal(asOf.requireChronology, true);
   assert.equal(asOf.asOf, "2023-01-01T00:00:00Z");
+}
+
+// ── FTS query planning ───────────────────────────────────────────────────────
+
+{
+  const plans = planFtsQueries("What DB config do we use?", ["project-a", "global"], "memory");
+  assert.equal(plans.length, 2, "multi-concept queries have precise and fallback plans");
+  assert.ok(plans[0]?.includes("database*") && plans[0]?.includes(" AND "), "synonyms participate in conjunctive retrieval");
+  assert.ok(plans[1]?.includes(" OR "), "fallback broadens concept matching");
+  assert.ok(plans.every((plan) => plan.includes('collection:"project-a"') && plan.includes('corpus:"memory"')),
+    "every plan is scoped inside FTS before ranking");
+  assert.deepEqual(planFtsQueries("what is it", ["project-a"], "all"), [], "stopword-only queries use the non-FTS fallback");
 }
 
 // ── Evidence budget ──────────────────────────────────────────────────────────
